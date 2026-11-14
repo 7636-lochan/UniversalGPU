@@ -58,6 +58,10 @@ public:
         if (symbols.count(name)) return symbols[name].mlirName;
         return "%" + name;
     }
+    std::string typeOf(const std::string &name) {
+        if (symbols.count(name)) return symbols[name].type;
+        return "f32";
+    }
 };
 
 std::string translateExpr(const Expr *E, CudaLauncher &L);
@@ -65,6 +69,46 @@ std::string translateExpr(const Expr *E, CudaLauncher &L);
 std::string translateExpr(const Expr *E, CudaLauncher &L) {
     if (!E) return "";
     E = E->IgnoreParenImpCasts();
+
+    if (const auto *CE = dyn_cast<CallExpr>(E)) {
+        if (const auto *FD = CE->getDirectCallee()) {
+            std::string name = FD->getNameAsString();
+            
+            if (name == "__syncthreads" || name == "__syncwarp") {
+                L.OS << "      gpu.barrier\n";
+                return "";
+            }
+            
+            if (name == "atomicAdd" && CE->getNumArgs() >= 2) {
+                std::string val = translateExpr(CE->getArg(1), L);
+                std::string ty = exprType(CE->getArg(1));
+                const Expr *ptrE = CE->getArg(0)->IgnoreParenImpCasts();
+                if (const auto *UO = dyn_cast<UnaryOperator>(ptrE)) {
+                    if (UO->getOpcode() == UO_AddrOf) {
+                        ptrE = UO->getSubExpr()->IgnoreParenImpCasts();
+                    }
+                }
+                if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(ptrE)) {
+                    std::string arr = translateExpr(ASE->getBase(), L);
+                    std::string idx = translateExpr(ASE->getIdx(), L);
+                    std::string v = "%" + std::to_string(TempVarCounter++);
+                    L.OS << "      " << v << " = memref.atomic_rmw addf " << val << ", "
+                         << arr << "[" << idx << "] : (memref<?x" << ty << ">, " << ty << ") -> " << ty << "\n";
+                    return v;
+                }
+                return val;
+            }
+            
+            if (name == "__shfl_sync" && CE->getNumArgs() >= 3) {
+                std::string mask = translateExpr(CE->getArg(0), L);
+                std::string val = translateExpr(CE->getArg(1), L);
+                std::string src = translateExpr(CE->getArg(2), L);
+                std::string v = "%" + std::to_string(TempVarCounter++);
+                L.OS << "      " << v << " = nvvm.shfl.sync.down " << mask << ", " << val << ", " << src << " : f32\n";
+                return v;
+            }
+        }
+    }
 
     if (const auto *Cast = dyn_cast<CXXStaticCastExpr>(E)) {
         std::string src = translateExpr(Cast->getSubExpr(), L);
@@ -88,8 +132,11 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
         return varName;
     }
 
-    if (const auto *DRE = dyn_cast<DeclRefExpr>(E))
-        return L.lookup(DRE->getDecl()->getNameAsString());
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+        std::string name = DRE->getDecl()->getNameAsString();
+        if (name == "i" || name == "k" || name == "iv") return "%iv";
+        return L.lookup(name);
+    }
 
     if (const auto *ME = dyn_cast<MemberExpr>(E)) {
         std::string baseName = "";
@@ -178,7 +225,6 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
                 else if (lty == "f64" || rty == "f64") ty = "f64";
             }
         }
-
         std::string op;
         switch (BO->getOpcode()) {
             case BO_Add: op = flt ? "arith.addf" : "arith.addi"; break;
@@ -186,25 +232,12 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
             case BO_Mul: op = flt ? "arith.mulf" : "arith.muli"; break;
             case BO_Div: op = flt ? "arith.divf" : "arith.divsi"; break;
             case BO_LT:  op = flt ? "arith.cmpf olt," : "arith.cmpi slt,"; break;
+            case BO_EQ:  op = flt ? "arith.cmpf oeq," : "arith.cmpi eq,"; break;
             default: return lhs;
         }
         std::string v = "%" + std::to_string(TempVarCounter++);
         L.OS << "      " << v << " = " << op << " " << lhs << ", " << rhs << " : " << ty << "\n";
         return v;
-    }
-
-    if (const auto *CE = dyn_cast<CallExpr>(E)) {
-        if (const auto *FD = CE->getDirectCallee()) {
-            std::string name = FD->getNameAsString();
-            if (name == "__shfl_sync" && CE->getNumArgs() >= 3) {
-                std::string mask = translateExpr(CE->getArg(0), L);
-                std::string val = translateExpr(CE->getArg(1), L);
-                std::string src = translateExpr(CE->getArg(2), L);
-                std::string v = "%" + std::to_string(TempVarCounter++);
-                L.OS << "      " << v << " = nvvm.shfl.sync.down " << mask << ", " << val << ", " << src << " : f32\n";
-                return v;
-            }
-        }
     }
 
     if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
@@ -252,12 +285,39 @@ BinaryOperator *findPlainAccumulation(Stmt *S) {
 void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
     if (!S) return;
 
+    // Handle atomicAdd as a standalone statement
+    if (auto *CE = dyn_cast<CallExpr>(S)) {
+        if (const auto *FD = CE->getDirectCallee()) {
+            if (FD->getNameAsString() == "atomicAdd" && CE->getNumArgs() >= 2) {
+                std::string val = translateExpr(CE->getArg(1), L);
+                std::string ty = exprType(CE->getArg(1));
+                const Expr *ptrE = CE->getArg(0)->IgnoreParenImpCasts();
+                if (const auto *UO = dyn_cast<UnaryOperator>(ptrE)) {
+                    if (UO->getOpcode() == UO_AddrOf) {
+                        ptrE = UO->getSubExpr()->IgnoreParenImpCasts();
+                    }
+                }
+                if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(ptrE)) {
+                    std::string arr = translateExpr(ASE->getBase(), L);
+                    std::string idx = translateExpr(ASE->getIdx(), L);
+                    L.OS << "      memref.atomic_rmw addf " << val << ", " << arr << "[" << idx
+                         << "] : (memref<?x" << ty << ">, " << ty << ") -> " << ty << "\n";
+                }
+                return;
+            }
+        }
+    }
+
     if (auto *DS = dyn_cast<DeclStmt>(S)) {
         for (auto *D : DS->decls()) {
             if (auto *VD = dyn_cast<VarDecl>(D)) {
                 std::string name = VD->getNameAsString();
                 if (VD->hasAttr<CUDASharedAttr>()) {
-                    std::string t = mlirType(VD->getType());
+                    QualType baseType = VD->getType();
+                    if (baseType->isArrayType()) {
+                        baseType = baseType->getAsArrayTypeUnsafe()->getElementType();
+                    }
+                    std::string t = mlirType(baseType);
                     L.declare(name, "%" + name, t, true);
                     L.OS << "      %" << name << " = memref.alloc() : memref<256x" << t << ">\n";
                 } else if (VD->hasInit()) {
@@ -276,7 +336,9 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
 
     if (auto *If = dyn_cast<IfStmt>(S)) {
         std::string cond = translateExpr(If->getCond(), L);
-        L.OS << "      scf.if " << cond << " {\n";
+        std::string c1 = "%cmp_" + std::to_string(TempVarCounter++);
+        L.OS << "      " << c1 << " = arith.cmpi ne, " << cond << ", %c0 : index\n";
+        L.OS << "      scf.if " << c1 << " {\n";
         dumpStmtAsMLIR(If->getThen(), L);
         L.OS << "      }";
         if (If->getElse()) {
@@ -290,7 +352,9 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
 
     if (auto *While = dyn_cast<WhileStmt>(S)) {
         std::string cond = translateExpr(While->getCond(), L);
-        L.OS << "      scf.while " << cond << " {\n";
+        std::string c1 = "%cmp_" + std::to_string(TempVarCounter++);
+        L.OS << "      " << c1 << " = arith.cmpi ne, " << cond << ", %c0 : index\n";
+        L.OS << "      scf.while " << c1 << " {\n";
         dumpStmtAsMLIR(While->getBody(), L);
         L.OS << "      }\n";
         return;
@@ -345,7 +409,6 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
             L.OS << "      " << init << " = arith.constant 0.0 : " << accType << "\n";
             L.OS << "      %result = scf.for %iv = %c0 to " << UB << " step %c1 iter_args("
                  << iter << " = " << init << ") -> (" << accType << ") {\n";
-            L.declare("k", "%iv", "index", false);
             std::string inner;
             if (CAO) {
                 inner = translateExpr(CAO->getRHS(), L);
@@ -367,7 +430,6 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
             L.declare(accVar, "%result", accType, false);
         } else {
             L.OS << "      scf.for %iv = %c0 to " << UB << " step %c1 {\n";
-            L.declare("k", "%iv", "index", false);
             dumpStmtAsMLIR(For->getBody(), L);
             L.OS << "      }\n";
         }
