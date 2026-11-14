@@ -4,6 +4,7 @@
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/Stmt.h"
 #include "clang/AST/StmtCXX.h"
+#include "clang/AST/DeclTemplate.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendAction.h"
 #include "clang/Tooling/CommonOptionsParser.h"
@@ -26,11 +27,16 @@ std::string mlirType(QualType T) {
         if (T->isSpecificBuiltinType(BuiltinType::Double)) return "f64";
         return "f32";
     }
+    if (T->isVectorType()) {
+        const auto *VT = T->getAs<VectorType>();
+        std::string elem = mlirType(VT->getElementType());
+        unsigned n = VT->getNumElements();
+        return "vector<" + std::to_string(n) + "x" + elem + ">";
+    }
     return "index";
 }
 
 bool isFloatLike(QualType T) { return T->isFloatingType(); }
-
 std::string exprType(const Expr *E) { return mlirType(E->getType()); }
 
 struct Symbol {
@@ -52,10 +58,6 @@ public:
         if (symbols.count(name)) return symbols[name].mlirName;
         return "%" + name;
     }
-    std::string typeOf(const std::string &name) {
-        if (symbols.count(name)) return symbols[name].type;
-        return "f32";
-    }
 };
 
 std::string translateExpr(const Expr *E, CudaLauncher &L);
@@ -63,6 +65,18 @@ std::string translateExpr(const Expr *E, CudaLauncher &L);
 std::string translateExpr(const Expr *E, CudaLauncher &L) {
     if (!E) return "";
     E = E->IgnoreParenImpCasts();
+
+    if (const auto *Cast = dyn_cast<CXXStaticCastExpr>(E)) {
+        std::string src = translateExpr(Cast->getSubExpr(), L);
+        std::string dstType = mlirType(Cast->getType());
+        std::string srcType = mlirType(Cast->getSubExpr()->getType());
+        if (dstType != srcType) {
+            std::string v = "%" + std::to_string(TempVarCounter++);
+            L.OS << "      " << v << " = arith.extf " << src << " : " << srcType << " to " << dstType << "\n";
+            return v;
+        }
+        return src;
+    }
 
     if (const auto *IL = dyn_cast<IntegerLiteral>(E))
         return "%c" + std::to_string(IL->getValue().getZExtValue());
@@ -93,8 +107,14 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
         std::string idx = translateExpr(ASE->getIdx(), L);
         std::string v = "%" + std::to_string(TempVarCounter++);
         std::string elemType = exprType(E);
-        L.OS << "      " << v << " = memref.load " << arr << "[" << idx
-             << "] : memref<?x" << elemType << ">\n";
+        
+        if (elemType.find("vector<") != std::string::npos) {
+            L.OS << "      " << v << " = vector.load " << arr << "[" << idx
+                 << "] : memref<?x" << elemType << ">, " << elemType << "\n";
+        } else {
+            L.OS << "      " << v << " = memref.load " << arr << "[" << idx
+                 << "] : memref<?x" << elemType << ">\n";
+        }
         return v;
     }
 
@@ -135,11 +155,9 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
         std::string lhs = translateExpr(BO->getLHS(), L);
         std::string rhs = translateExpr(BO->getRHS(), L);
         bool flt = isFloatLike(BO->getType());
-        
         std::string ty = "index";
         if (flt) {
-            ty = "f32"; // Default
-            // Trace operands to their array base to find f16
+            ty = "f32";
             auto checkF16 = [&](const Expr *op) -> bool {
                 const Expr *oe = op->IgnoreParenImpCasts();
                 if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(oe)) {
@@ -152,10 +170,8 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
                 }
                 return false;
             };
-            
-            if (checkF16(BO->getLHS()) || checkF16(BO->getRHS())) {
-                ty = "f16";
-            } else {
+            if (checkF16(BO->getLHS()) || checkF16(BO->getRHS())) ty = "f16";
+            else {
                 std::string lty = mlirType(BO->getLHS()->getType());
                 std::string rty = mlirType(BO->getRHS()->getType());
                 if (lty == "f16" || rty == "f16") ty = "f16";
@@ -175,6 +191,20 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
         std::string v = "%" + std::to_string(TempVarCounter++);
         L.OS << "      " << v << " = " << op << " " << lhs << ", " << rhs << " : " << ty << "\n";
         return v;
+    }
+
+    if (const auto *CE = dyn_cast<CallExpr>(E)) {
+        if (const auto *FD = CE->getDirectCallee()) {
+            std::string name = FD->getNameAsString();
+            if (name == "__shfl_sync" && CE->getNumArgs() >= 3) {
+                std::string mask = translateExpr(CE->getArg(0), L);
+                std::string val = translateExpr(CE->getArg(1), L);
+                std::string src = translateExpr(CE->getArg(2), L);
+                std::string v = "%" + std::to_string(TempVarCounter++);
+                L.OS << "      " << v << " = nvvm.shfl.sync.down " << mask << ", " << val << ", " << src << " : f32\n";
+                return v;
+            }
+        }
     }
 
     if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
@@ -356,11 +386,11 @@ class CudaLaunchVisitor : public RecursiveASTVisitor<CudaLaunchVisitor> {
 public:
     explicit CudaLaunchVisitor(ASTContext *Context) : Context(Context) {}
 
-    bool VisitFunctionDecl(FunctionDecl *FD) {
-        if (!FD->hasAttr<CUDAGlobalAttr>()) return true;
-        std::string kernelName = FD->getNameAsString();
-        if (!FD->hasBody()) return true;
+    void emitKernel(FunctionDecl *FD) {
+        if (!FD || !FD->hasBody()) return;
+        if (!FD->hasAttr<CUDAGlobalAttr>()) return;
 
+        std::string kernelName = FD->getNameAsString();
         TempVarCounter = 0;
         llvm::outs() << "module {\n";
         llvm::outs() << "  func.func @" << kernelName << "(";
@@ -384,7 +414,6 @@ public:
             L.declare(pname, "%" + pname, ptype, isMemref);
         }
         llvm::outs() << ") {\n";
-
         llvm::outs() << "    %c0 = arith.constant 0 : index\n";
         llvm::outs() << "    %c1 = arith.constant 1 : index\n";
         llvm::outs() << "    %c2 = arith.constant 2 : index\n";
@@ -396,15 +425,27 @@ public:
         llvm::outs() << "      %tx = arith.remsi %row, %c2 : index\n";
         llvm::outs() << "      %by = arith.divsi %col, %c2 : index\n";
         llvm::outs() << "      %ty = arith.remsi %col, %c2 : index\n";
-
         dumpStmtAsMLIR(FD->getBody(), L);
-
         llvm::outs() << "    }\n";
         llvm::outs() << "    return\n";
         llvm::outs() << "  }\n";
         llvm::outs() << "}\n";
+    }
+
+    bool VisitFunctionDecl(FunctionDecl *FD) {
+        if (FD->getTemplatedKind() == FunctionDecl::TK_FunctionTemplate) return true;
+        emitKernel(FD);
         return true;
     }
+
+    bool VisitFunctionTemplateDecl(FunctionTemplateDecl *FTD) {
+        if (!FTD->getTemplatedDecl()->hasAttr<CUDAGlobalAttr>()) return true;
+        for (auto *Spec : FTD->specializations()) {
+            emitKernel(Spec);
+        }
+        return true;
+    }
+
 private:
     ASTContext *Context;
 };
