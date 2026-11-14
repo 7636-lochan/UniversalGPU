@@ -79,9 +79,10 @@ matmul:
     v_mul_f32_e32 v1, 0x5f7ffffc, v1
 
 ## Known Limitations
-- f16 math is promoted to f32 (loads/stores correctly f16)
-- No full PyTorch integration yet (needs cuBLAS/cuDNN shims)
+
+- No full PyTorch integration yet (needs `cuBLAS`/`cuDNN` shims)
 - No C++ templates, warp primitives, or inline PTX
+- Runtime shim falls back to host memory when the driver bridge is unavailable
 
 ## Roadmap
 - [x] Phase 1: Clang AST parsing (CUDA)
@@ -90,7 +91,6 @@ matmul:
 - [x] Phase 4: Workload splitter (AMD/Intel routing)
 - [x] Verified PTX and GCN backend generation
 - [ ] Full PyTorch integration
-- [ ] f16 math promotion fix
 
 ## License
 MIT
