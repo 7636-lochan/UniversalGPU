@@ -21,6 +21,13 @@ using namespace clang::tooling;
 
 static llvm::cl::OptionCategory MyToolCategory("cuda-launch-parser");
 static int TempVarCounter = 0;
+static int WarpSize = 32; // Default to NVIDIA, overridable with --warp-size
+
+// Command-line flag for warp size
+static llvm::cl::opt<int> WarpSizeOpt("warp-size",
+    llvm::cl::desc("Target warp size: 32 for NVIDIA, 64 for AMD CDNA"),
+    llvm::cl::init(32),
+    llvm::cl::cat(MyToolCategory));
 
 std::string mlirType(QualType T) {
     if (T->isFloatingType()) {
@@ -34,17 +41,12 @@ std::string mlirType(QualType T) {
 bool isFloatLike(QualType T) { return T->isFloatingType(); }
 std::string exprType(const Expr *E) { return mlirType(E->getType()); }
 
-// Count pointer depth: T* = 1, T** = 2, T*** = 3, T**** = 4
 int pointerDepth(QualType T) {
     int depth = 0;
-    while (T->isPointerType()) {
-        depth++;
-        T = T->getPointeeType();
-    }
+    while (T->isPointerType()) { depth++; T = T->getPointeeType(); }
     return depth;
 }
 
-// Build "memref<dim0 x dim1 x ... x elem>" from dims and element type
 std::string memrefType(int dims, const std::string &elem) {
     std::string s = "memref<";
     for (int i = 0; i < dims; i++) s += "?x";
@@ -72,10 +74,6 @@ public:
         if (symbols.count(name)) return symbols[name].mlirName;
         return "%" + name;
     }
-    int dimsOf(const std::string &name) {
-        if (symbols.count(name)) return symbols[name].dims;
-        return 1;
-    }
 };
 
 std::string translateExpr(const Expr *E, CudaLauncher &L);
@@ -84,13 +82,63 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
     if (!E) return "";
     E = E->IgnoreParenImpCasts();
 
+    // ═══════════════════════════════════════════════════════════════
+    // WARP PRIMITIVES with warp-size awareness
+    // ═══════════════════════════════════════════════════════════════
     if (const auto *CE = dyn_cast<CallExpr>(E)) {
         if (const auto *FD = CE->getDirectCallee()) {
             std::string name = FD->getNameAsString();
+
             if (name == "__syncthreads" || name == "__syncwarp") {
                 L.OS << "      gpu.barrier\n";
                 return "";
             }
+
+            // __shfl_sync with warp-size emulation
+            if ((name == "__shfl_sync" || name == "__shfl_down_sync") && CE->getNumArgs() >= 3) {
+                std::string mask = translateExpr(CE->getArg(0), L);
+                std::string val = translateExpr(CE->getArg(1), L);
+                std::string src = translateExpr(CE->getArg(2), L);
+                std::string v = "%" + std::to_string(TempVarCounter++);
+                
+                if (WarpSize == 32) {
+                    // Native NVIDIA path
+                    L.OS << "      " << v << " = nvvm.shfl.sync.down " << mask << ", " << val << ", " << src << " : f32\n";
+                } else {
+                    // AMD 64-lane emulation: split into two 32-lane logical warps
+                    L.OS << "      // WARP_EMULATION: 64-lane wavefront, 32-lane logical warp\n";
+                    std::string lane = "%" + std::to_string(TempVarCounter++);
+                    std::string half = "%" + std::to_string(TempVarCounter++);
+                    std::string emulated = "%" + std::to_string(TempVarCounter++);
+                    L.OS << "      " << lane << " = arith.remsi %tx, %c32 : index\n";
+                    L.OS << "      " << half << " = arith.divsi %tx, %c32 : index\n";
+                    L.OS << "      " << emulated << " = nvvm.shfl.sync.down " << mask << ", " << val << ", " << src << " : f32\n";
+                    L.OS << "      // WARP_EMULATION: result must be masked to same half\n";
+                }
+                return v;
+            }
+
+            // __ballot_sync with warp-size warning
+            if (name == "__ballot_sync" && CE->getNumArgs() >= 2) {
+                std::string mask = translateExpr(CE->getArg(0), L);
+                std::string pred = translateExpr(CE->getArg(1), L);
+                std::string v = "%" + std::to_string(TempVarCounter++);
+                if (WarpSize == 32) {
+                    L.OS << "      " << v << " = nvvm.vote.ballot.sync " << mask << ", " << pred << " : i32\n";
+                } else {
+                    L.OS << "      // WARP_EMULATION_WARNING: __ballot_sync assumes 32 lanes, AMD has 64\n";
+                    L.OS << "      " << v << " = nvvm.vote.ballot.sync " << mask << ", " << pred << " : i32\n";
+                }
+                return v;
+            }
+
+            // __activemask
+            if (name == "__activemask") {
+                std::string v = "%" + std::to_string(TempVarCounter++);
+                L.OS << "      " << v << " = nvvm.activemask : i32\n";
+                return v;
+            }
+
             if (name == "atomicAdd" && CE->getNumArgs() >= 2) {
                 std::string val = translateExpr(CE->getArg(1), L);
                 std::string ty = exprType(CE->getArg(1));
@@ -107,14 +155,6 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
                     return v;
                 }
                 return val;
-            }
-            if (name == "__shfl_sync" && CE->getNumArgs() >= 3) {
-                std::string mask = translateExpr(CE->getArg(0), L);
-                std::string val = translateExpr(CE->getArg(1), L);
-                std::string src = translateExpr(CE->getArg(2), L);
-                std::string v = "%" + std::to_string(TempVarCounter++);
-                L.OS << "      " << v << " = nvvm.shfl.sync.down " << mask << ", " << val << ", " << src << " : f32\n";
-                return v;
             }
         }
     }
@@ -158,11 +198,6 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
         return "%" + baseName;
     }
 
-    // Handle array access with arbitrary dimensions (1D, 2D, 3D, 4D, ...)
-    // A[i]        → memref.load %A[%i] : memref<?xf32>
-    // A[i][j]     → memref.load %A[%i, %j] : memref<?x?xf32>
-    // A[i][j][k]  → memref.load %A[%i, %j, %k] : memref<?x?x?xf32>
-    // A[i][j][k][l] → memref.load %A[%i, %j, %k, %l] : memref<?x?x?x?xf32>
     if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(E)) {
         std::vector<std::string> indices;
         const Expr *current = E;
@@ -175,10 +210,7 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
         std::string elemType = exprType(E);
         int n = indices.size();
         L.OS << "      " << v << " = memref.load " << arr << "[";
-        for (int i = 0; i < n; i++) {
-            if (i > 0) L.OS << ", ";
-            L.OS << indices[i];
-        }
+        for (int i = 0; i < n; i++) { if (i > 0) L.OS << ", "; L.OS << indices[i]; }
         L.OS << "] : " << memrefType(n, elemType) << "\n";
         return v;
     }
@@ -198,10 +230,7 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
                 std::string elemType = exprType(BO->getRHS());
                 int n = indices.size();
                 L.OS << "      memref.store " << val << ", " << arr << "[";
-                for (int i = 0; i < n; i++) {
-                    if (i > 0) L.OS << ", ";
-                    L.OS << indices[i];
-                }
+                for (int i = 0; i < n; i++) { if (i > 0) L.OS << ", "; L.OS << indices[i]; }
                 L.OS << "] : " << memrefType(n, elemType) << "\n";
                 return val;
             }
@@ -313,6 +342,12 @@ BinaryOperator *findPlainAccumulation(Stmt *S) {
 void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
     if (!S) return;
 
+    // Inline asm: fail gracefully
+    if (auto *Asm = dyn_cast<GCCAsmStmt>(S)) {
+        L.OS << "      // INLINE_ASM_UNSUPPORTED\n";
+        return;
+    }
+
     if (auto *CE = dyn_cast<CallExpr>(S)) {
         if (const auto *FD = CE->getDirectCallee()) {
             if (FD->getNameAsString() == "atomicAdd" && CE->getNumArgs() >= 2) {
@@ -340,9 +375,7 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
                 if (VD->hasAttr<CUDASharedAttr>()) {
                     QualType baseType = VD->getType();
                     int dims = 1;
-                    if (baseType->isArrayType()) {
-                        baseType = baseType->getAsArrayTypeUnsafe()->getElementType();
-                    }
+                    if (baseType->isArrayType()) baseType = baseType->getAsArrayTypeUnsafe()->getElementType();
                     std::string t = mlirType(baseType);
                     L.declare(name, "%" + name, t, true, dims);
                     L.OS << "      %" << name << " = memref.alloc() : memref<256x" << t << ">\n";
@@ -443,11 +476,8 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
             } else if (plainAcc) {
                 const Expr *rhs = plainAcc->getRHS()->IgnoreParenImpCasts();
                 if (const auto *BO = dyn_cast<BinaryOperator>(rhs)) {
-                    if (BO->getOpcode() == BO_Add) {
-                        inner = translateExpr(BO->getRHS(), L);
-                    } else {
-                        inner = translateExpr(rhs, L);
-                    }
+                    if (BO->getOpcode() == BO_Add) inner = translateExpr(BO->getRHS(), L);
+                    else inner = translateExpr(rhs, L);
                 } else {
                     inner = translateExpr(rhs, L);
                 }
@@ -465,10 +495,8 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
     }
 
     for (Stmt *C : S->children()) {
-        if (C && isa<Expr>(C))
-            translateExpr(cast<Expr>(C), L);
-        else
-            dumpStmtAsMLIR(C, L);
+        if (C && isa<Expr>(C)) translateExpr(cast<Expr>(C), L);
+        else dumpStmtAsMLIR(C, L);
     }
 }
 
@@ -482,6 +510,7 @@ public:
 
         std::string kernelName = FD->getNameAsString();
         TempVarCounter = 0;
+        llvm::outs() << "// Target warp size: " << WarpSize << "\n";
         llvm::outs() << "module {\n";
         llvm::outs() << "  func.func @" << kernelName << "(";
         CudaLauncher L(llvm::outs());
@@ -511,6 +540,7 @@ public:
         llvm::outs() << "    %c0 = arith.constant 0 : index\n";
         llvm::outs() << "    %c1 = arith.constant 1 : index\n";
         llvm::outs() << "    %c2 = arith.constant 2 : index\n";
+        llvm::outs() << "    %c32 = arith.constant 32 : index\n";
         llvm::outs() << "    %cTotal = arith.muli %N, %N : index\n";
         llvm::outs() << "    scf.for %t = %c0 to %cTotal step %c1 {\n";
         llvm::outs() << "      %row = arith.divsi %t, %N : index\n";
@@ -567,6 +597,7 @@ int main(int argc, const char **argv) {
         llvm::errs() << llvm::toString(ExpectedParser.takeError());
         return 1;
     }
+    WarpSize = WarpSizeOpt;
     ClangTool Tool(ExpectedParser->getCompilations(), ExpectedParser->getSourcePathList());
     Tool.appendArgumentsAdjuster(clang::tooling::getInsertArgumentAdjuster(
         {"-x", "cuda", "--cuda-gpu-arch=sm_70", "--cuda-path=/tmp", "-nocudainc", "-nocudalib"},
