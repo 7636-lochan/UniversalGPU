@@ -14,6 +14,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include <map>
 #include <string>
+#include <vector>
 
 using namespace clang;
 using namespace clang::tooling;
@@ -27,22 +28,35 @@ std::string mlirType(QualType T) {
         if (T->isSpecificBuiltinType(BuiltinType::Double)) return "f64";
         return "f32";
     }
-    if (T->isVectorType()) {
-        const auto *VT = T->getAs<VectorType>();
-        std::string elem = mlirType(VT->getElementType());
-        unsigned n = VT->getNumElements();
-        return "vector<" + std::to_string(n) + "x" + elem + ">";
-    }
     return "index";
 }
 
 bool isFloatLike(QualType T) { return T->isFloatingType(); }
 std::string exprType(const Expr *E) { return mlirType(E->getType()); }
 
+// Count pointer depth: T* = 1, T** = 2, T*** = 3, T**** = 4
+int pointerDepth(QualType T) {
+    int depth = 0;
+    while (T->isPointerType()) {
+        depth++;
+        T = T->getPointeeType();
+    }
+    return depth;
+}
+
+// Build "memref<dim0 x dim1 x ... x elem>" from dims and element type
+std::string memrefType(int dims, const std::string &elem) {
+    std::string s = "memref<";
+    for (int i = 0; i < dims; i++) s += "?x";
+    s += elem + ">";
+    return s;
+}
+
 struct Symbol {
     std::string mlirName;
     std::string type;
     bool isMemref;
+    int dims;
 };
 
 class CudaLauncher {
@@ -51,16 +65,16 @@ public:
     raw_ostream &OS;
     CudaLauncher(raw_ostream &OS) : OS(OS) {}
     void declare(const std::string &name, const std::string &mlirName,
-                 const std::string &type, bool isMemref) {
-        symbols[name] = {mlirName, type, isMemref};
+                 const std::string &type, bool isMemref, int dims = 1) {
+        symbols[name] = {mlirName, type, isMemref, dims};
     }
     std::string lookup(const std::string &name) {
         if (symbols.count(name)) return symbols[name].mlirName;
         return "%" + name;
     }
-    std::string typeOf(const std::string &name) {
-        if (symbols.count(name)) return symbols[name].type;
-        return "f32";
+    int dimsOf(const std::string &name) {
+        if (symbols.count(name)) return symbols[name].dims;
+        return 1;
     }
 };
 
@@ -73,20 +87,16 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
     if (const auto *CE = dyn_cast<CallExpr>(E)) {
         if (const auto *FD = CE->getDirectCallee()) {
             std::string name = FD->getNameAsString();
-            
             if (name == "__syncthreads" || name == "__syncwarp") {
                 L.OS << "      gpu.barrier\n";
                 return "";
             }
-            
             if (name == "atomicAdd" && CE->getNumArgs() >= 2) {
                 std::string val = translateExpr(CE->getArg(1), L);
                 std::string ty = exprType(CE->getArg(1));
                 const Expr *ptrE = CE->getArg(0)->IgnoreParenImpCasts();
                 if (const auto *UO = dyn_cast<UnaryOperator>(ptrE)) {
-                    if (UO->getOpcode() == UO_AddrOf) {
-                        ptrE = UO->getSubExpr()->IgnoreParenImpCasts();
-                    }
+                    if (UO->getOpcode() == UO_AddrOf) ptrE = UO->getSubExpr()->IgnoreParenImpCasts();
                 }
                 if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(ptrE)) {
                     std::string arr = translateExpr(ASE->getBase(), L);
@@ -98,7 +108,6 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
                 }
                 return val;
             }
-            
             if (name == "__shfl_sync" && CE->getNumArgs() >= 3) {
                 std::string mask = translateExpr(CE->getArg(0), L);
                 std::string val = translateExpr(CE->getArg(1), L);
@@ -149,19 +158,28 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
         return "%" + baseName;
     }
 
+    // Handle array access with arbitrary dimensions (1D, 2D, 3D, 4D, ...)
+    // A[i]        → memref.load %A[%i] : memref<?xf32>
+    // A[i][j]     → memref.load %A[%i, %j] : memref<?x?xf32>
+    // A[i][j][k]  → memref.load %A[%i, %j, %k] : memref<?x?x?xf32>
+    // A[i][j][k][l] → memref.load %A[%i, %j, %k, %l] : memref<?x?x?x?xf32>
     if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(E)) {
-        std::string arr = translateExpr(ASE->getBase(), L);
-        std::string idx = translateExpr(ASE->getIdx(), L);
+        std::vector<std::string> indices;
+        const Expr *current = E;
+        while (const auto *curASE = dyn_cast<ArraySubscriptExpr>(current->IgnoreParenImpCasts())) {
+            indices.insert(indices.begin(), translateExpr(curASE->getIdx(), L));
+            current = curASE->getBase();
+        }
+        std::string arr = translateExpr(current, L);
         std::string v = "%" + std::to_string(TempVarCounter++);
         std::string elemType = exprType(E);
-        
-        if (elemType.find("vector<") != std::string::npos) {
-            L.OS << "      " << v << " = vector.load " << arr << "[" << idx
-                 << "] : memref<?x" << elemType << ">, " << elemType << "\n";
-        } else {
-            L.OS << "      " << v << " = memref.load " << arr << "[" << idx
-                 << "] : memref<?x" << elemType << ">\n";
+        int n = indices.size();
+        L.OS << "      " << v << " = memref.load " << arr << "[";
+        for (int i = 0; i < n; i++) {
+            if (i > 0) L.OS << ", ";
+            L.OS << indices[i];
         }
+        L.OS << "] : " << memrefType(n, elemType) << "\n";
         return v;
     }
 
@@ -169,12 +187,22 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
         if (BO->getOpcode() == BO_Assign) {
             const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();
             if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(LHS)) {
-                std::string arr = translateExpr(ASE->getBase(), L);
-                std::string idx = translateExpr(ASE->getIdx(), L);
+                std::vector<std::string> indices;
+                const Expr *current = LHS;
+                while (const auto *curASE = dyn_cast<ArraySubscriptExpr>(current->IgnoreParenImpCasts())) {
+                    indices.insert(indices.begin(), translateExpr(curASE->getIdx(), L));
+                    current = curASE->getBase();
+                }
+                std::string arr = translateExpr(current, L);
                 std::string val = translateExpr(BO->getRHS(), L);
                 std::string elemType = exprType(BO->getRHS());
-                L.OS << "      memref.store " << val << ", " << arr << "[" << idx
-                     << "] : memref<?x" << elemType << ">\n";
+                int n = indices.size();
+                L.OS << "      memref.store " << val << ", " << arr << "[";
+                for (int i = 0; i < n; i++) {
+                    if (i > 0) L.OS << ", ";
+                    L.OS << indices[i];
+                }
+                L.OS << "] : " << memrefType(n, elemType) << "\n";
                 return val;
             }
             if (const auto *DRE = dyn_cast<DeclRefExpr>(LHS)) {
@@ -285,7 +313,6 @@ BinaryOperator *findPlainAccumulation(Stmt *S) {
 void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
     if (!S) return;
 
-    // Handle atomicAdd as a standalone statement
     if (auto *CE = dyn_cast<CallExpr>(S)) {
         if (const auto *FD = CE->getDirectCallee()) {
             if (FD->getNameAsString() == "atomicAdd" && CE->getNumArgs() >= 2) {
@@ -293,9 +320,7 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
                 std::string ty = exprType(CE->getArg(1));
                 const Expr *ptrE = CE->getArg(0)->IgnoreParenImpCasts();
                 if (const auto *UO = dyn_cast<UnaryOperator>(ptrE)) {
-                    if (UO->getOpcode() == UO_AddrOf) {
-                        ptrE = UO->getSubExpr()->IgnoreParenImpCasts();
-                    }
+                    if (UO->getOpcode() == UO_AddrOf) ptrE = UO->getSubExpr()->IgnoreParenImpCasts();
                 }
                 if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(ptrE)) {
                     std::string arr = translateExpr(ASE->getBase(), L);
@@ -314,15 +339,18 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
                 std::string name = VD->getNameAsString();
                 if (VD->hasAttr<CUDASharedAttr>()) {
                     QualType baseType = VD->getType();
+                    int dims = 1;
                     if (baseType->isArrayType()) {
                         baseType = baseType->getAsArrayTypeUnsafe()->getElementType();
                     }
                     std::string t = mlirType(baseType);
-                    L.declare(name, "%" + name, t, true);
+                    L.declare(name, "%" + name, t, true, dims);
                     L.OS << "      %" << name << " = memref.alloc() : memref<256x" << t << ">\n";
                 } else if (VD->hasInit()) {
                     std::string v = translateExpr(VD->getInit(), L);
-                    L.declare(name, v, mlirType(VD->getType()), false);
+                    int dims = pointerDepth(VD->getType());
+                    if (dims == 0) dims = 1;
+                    L.declare(name, v, mlirType(VD->getType()), false, dims);
                 } else {
                     std::string t = mlirType(VD->getType());
                     std::string init = "%zero_" + name;
@@ -462,10 +490,14 @@ public:
             std::string pname = Param->getNameAsString();
             std::string ptype;
             bool isMemref = false;
+            int dims = 1;
             if (Param->getType()->isPointerType()) {
-                QualType pointee = Param->getType()->getPointeeType();
-                std::string elem = mlirType(pointee);
-                ptype = "memref<?x" + elem + ">";
+                dims = pointerDepth(Param->getType());
+                if (dims == 0) dims = 1;
+                QualType baseT = Param->getType();
+                for (int i = 0; i < dims; i++) baseT = baseT->getPointeeType();
+                std::string elem = mlirType(baseT);
+                ptype = memrefType(dims, elem);
                 isMemref = true;
             } else {
                 ptype = "index";
@@ -473,7 +505,7 @@ public:
             if (!first) llvm::outs() << ", ";
             first = false;
             llvm::outs() << "%" << pname << ": " << ptype;
-            L.declare(pname, "%" + pname, ptype, isMemref);
+            L.declare(pname, "%" + pname, ptype, isMemref, dims);
         }
         llvm::outs() << ") {\n";
         llvm::outs() << "    %c0 = arith.constant 0 : index\n";
