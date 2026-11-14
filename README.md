@@ -39,3 +39,23 @@ Requires: clang-22, mlir-22, g++
 
 MIT
 
+## Verified Backends
+
+From a single CUDA source file, UniversalGPU generates:
+
+- **x86 assembly** (verified running correctly with 8.0 x 16 output)
+- **NVIDIA PTX** (.target sm_70, ld.global.f32, fma.rn.f32)
+- **AMD GCN** (v_mul_f32, v_rcp_f32, buffer_load_dword)
+
+### Example PTX Output
+.version 6.0
+.target sm_70
+.visible .func matmul(...)
+    ld.param.b64 %rd8, [matmul_param_15];
+    mul.lo.s64 %rd1, %rd8, %rd8;
+
+### Example GCN Output
+.globl matmul
+matmul:
+    v_mad_u64_u32 v[4:5], s[4:5], v30, v30, 0
+    v_mul_f32_e32 v1, 0x5f7ffffc, v1
