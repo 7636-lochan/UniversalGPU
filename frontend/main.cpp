@@ -135,7 +135,34 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
         std::string lhs = translateExpr(BO->getLHS(), L);
         std::string rhs = translateExpr(BO->getRHS(), L);
         bool flt = isFloatLike(BO->getType());
-        std::string ty = flt ? exprType(BO->getLHS()) : "index";
+        
+        std::string ty = "index";
+        if (flt) {
+            ty = "f32"; // Default
+            // Trace operands to their array base to find f16
+            auto checkF16 = [&](const Expr *op) -> bool {
+                const Expr *oe = op->IgnoreParenImpCasts();
+                if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(oe)) {
+                    if (const auto *BaseDRE = dyn_cast<DeclRefExpr>(ASE->getBase()->IgnoreParenImpCasts())) {
+                        std::string name = BaseDRE->getDecl()->getNameAsString();
+                        if (L.symbols.count(name) && L.symbols[name].type.find("f16") != std::string::npos) {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            };
+            
+            if (checkF16(BO->getLHS()) || checkF16(BO->getRHS())) {
+                ty = "f16";
+            } else {
+                std::string lty = mlirType(BO->getLHS()->getType());
+                std::string rty = mlirType(BO->getRHS()->getType());
+                if (lty == "f16" || rty == "f16") ty = "f16";
+                else if (lty == "f64" || rty == "f64") ty = "f64";
+            }
+        }
+
         std::string op;
         switch (BO->getOpcode()) {
             case BO_Add: op = flt ? "arith.addf" : "arith.addi"; break;
