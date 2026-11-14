@@ -1,0 +1,14 @@
+frontend/build/
+runtime/*.so
+runtime/*.o
+runtime/test_*
+runtime/driver
+*.mlir
+*.ll
+*.s
+ugpu_env/
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+*.swp
