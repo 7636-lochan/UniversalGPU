@@ -26,7 +26,36 @@ Output:
 ## Build
 
 Requires: clang-22, mlir-22, g++
+  
+### Quick Start
 
+```bash
+# 1. Compile the matmul CUDA kernel to MLIR
+cd frontend/build
+./cuda-launch-parser ../../tests/matmul.cu -- > matmul.mlir
+
+# 2. Lower MLIR to LLVM IR
+mlir-opt-22 matmul.mlir \
+  --convert-scf-to-cf \
+  --convert-func-to-llvm \
+  --convert-arith-to-llvm \
+  --finalize-memref-to-llvm \
+  --convert-cf-to-llvm \
+  --reconcile-unrealized-casts \
+  -o matmul_llvm.mlir
+
+mlir-translate-22 matmul_llvm.mlir --mlir-to-llvmir -o matmul.ll
+
+# 3. Generate NVIDIA PTX
+llc-22 matmul.ll -march=nvptx64 -mcpu=sm_70 -o matmul.ptx
+
+# 4. Generate AMD GCN
+llc-22 matmul.ll -march=amdgcn -mcpu=gfx90a -o matmul.amdgcn
+
+# 5. Compile to native x86 binary and run it
+cd ../../runtime
+clang-22 driver.c ../frontend/build/matmul.ll -o test_matmul -lm
+./test_matmul
 ./build.sh
 
 ## Known Limitations
