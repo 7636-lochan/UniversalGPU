@@ -39,3 +39,7 @@ cd UniversalGPU
 ## License
 
 MIT
+
+## Inline PTX Instructions Supported (20)
+
+shfl.sync.down, shfl.sync.up, shfl.sync.bfly, shfl.sync, bar.sync, fma.rn.f32, mad.lo.s32, mad.lo.u32, ld.global.f32, ld.shared.f32, ld.global, st.global.f32, st.shared.f32, st.global, mov.b32, mov.f32, mov.b64, mov.u64, setp.lt.f32, setp.eq.f32, setp.lt.s32, setp.lt.u32, setp.eq.s32, setp.eq.u32, selp.f32, and.b32, or.b32, xor.b32, shl.b32, shr.b32
