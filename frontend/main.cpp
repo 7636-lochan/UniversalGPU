@@ -21,9 +21,8 @@ using namespace clang::tooling;
 
 static llvm::cl::OptionCategory MyToolCategory("cuda-launch-parser");
 static int TempVarCounter = 0;
-static int WarpSize = 32; // Default to NVIDIA, overridable with --warp-size
+static int WarpSize = 32;
 
-// Command-line flag for warp size
 static llvm::cl::opt<int> WarpSizeOpt("warp-size",
     llvm::cl::desc("Target warp size: 32 for NVIDIA, 64 for AMD CDNA"),
     llvm::cl::init(32),
@@ -82,63 +81,13 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
     if (!E) return "";
     E = E->IgnoreParenImpCasts();
 
-    // ═══════════════════════════════════════════════════════════════
-    // WARP PRIMITIVES with warp-size awareness
-    // ═══════════════════════════════════════════════════════════════
     if (const auto *CE = dyn_cast<CallExpr>(E)) {
         if (const auto *FD = CE->getDirectCallee()) {
             std::string name = FD->getNameAsString();
-
             if (name == "__syncthreads" || name == "__syncwarp") {
                 L.OS << "      gpu.barrier\n";
                 return "";
             }
-
-            // __shfl_sync with warp-size emulation
-            if ((name == "__shfl_sync" || name == "__shfl_down_sync") && CE->getNumArgs() >= 3) {
-                std::string mask = translateExpr(CE->getArg(0), L);
-                std::string val = translateExpr(CE->getArg(1), L);
-                std::string src = translateExpr(CE->getArg(2), L);
-                std::string v = "%" + std::to_string(TempVarCounter++);
-                
-                if (WarpSize == 32) {
-                    // Native NVIDIA path
-                    L.OS << "      " << v << " = nvvm.shfl.sync.down " << mask << ", " << val << ", " << src << " : f32\n";
-                } else {
-                    // AMD 64-lane emulation: split into two 32-lane logical warps
-                    L.OS << "      // WARP_EMULATION: 64-lane wavefront, 32-lane logical warp\n";
-                    std::string lane = "%" + std::to_string(TempVarCounter++);
-                    std::string half = "%" + std::to_string(TempVarCounter++);
-                    std::string emulated = "%" + std::to_string(TempVarCounter++);
-                    L.OS << "      " << lane << " = arith.remsi %tx, %c32 : index\n";
-                    L.OS << "      " << half << " = arith.divsi %tx, %c32 : index\n";
-                    L.OS << "      " << emulated << " = nvvm.shfl.sync.down " << mask << ", " << val << ", " << src << " : f32\n";
-                    L.OS << "      // WARP_EMULATION: result must be masked to same half\n";
-                }
-                return v;
-            }
-
-            // __ballot_sync with warp-size warning
-            if (name == "__ballot_sync" && CE->getNumArgs() >= 2) {
-                std::string mask = translateExpr(CE->getArg(0), L);
-                std::string pred = translateExpr(CE->getArg(1), L);
-                std::string v = "%" + std::to_string(TempVarCounter++);
-                if (WarpSize == 32) {
-                    L.OS << "      " << v << " = nvvm.vote.ballot.sync " << mask << ", " << pred << " : i32\n";
-                } else {
-                    L.OS << "      // WARP_EMULATION_WARNING: __ballot_sync assumes 32 lanes, AMD has 64\n";
-                    L.OS << "      " << v << " = nvvm.vote.ballot.sync " << mask << ", " << pred << " : i32\n";
-                }
-                return v;
-            }
-
-            // __activemask
-            if (name == "__activemask") {
-                std::string v = "%" + std::to_string(TempVarCounter++);
-                L.OS << "      " << v << " = nvvm.activemask : i32\n";
-                return v;
-            }
-
             if (name == "atomicAdd" && CE->getNumArgs() >= 2) {
                 std::string val = translateExpr(CE->getArg(1), L);
                 std::string ty = exprType(CE->getArg(1));
@@ -155,6 +104,14 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
                     return v;
                 }
                 return val;
+            }
+            if (name == "__shfl_sync" && CE->getNumArgs() >= 3) {
+                std::string mask = translateExpr(CE->getArg(0), L);
+                std::string val = translateExpr(CE->getArg(1), L);
+                std::string src = translateExpr(CE->getArg(2), L);
+                std::string v = "%" + std::to_string(TempVarCounter++);
+                L.OS << "      " << v << " = nvvm.shfl.sync.down " << mask << ", " << val << ", " << src << " : f32\n";
+                return v;
             }
         }
     }
@@ -342,9 +299,58 @@ BinaryOperator *findPlainAccumulation(Stmt *S) {
 void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
     if (!S) return;
 
-    // Inline asm: fail gracefully
+    // ═══════════════════════════════════════════════════════════════
+    // MONTH 1: Inline PTX Interception (Top 5 Instructions)
+    // ═══════════════════════════════════════════════════════════════
     if (auto *Asm = dyn_cast<GCCAsmStmt>(S)) {
-        L.OS << "      // INLINE_ASM_UNSUPPORTED\n";
+        std::string asmStr = Asm->getAsmString();
+        std::vector<std::string> operands;
+        for (unsigned i = 0; i < Asm->getNumInputs(); i++)
+            operands.push_back(translateExpr(Asm->getInputExpr(i), L));
+        for (unsigned i = 0; i < Asm->getNumOutputs(); i++)
+            operands.push_back(translateExpr(Asm->getOutputExpr(i), L));
+
+        if (asmStr.find("shfl.sync") != std::string::npos) {
+            std::string v = "%" + std::to_string(TempVarCounter++);
+            std::string val = operands.size() > 0 ? operands[0] : "%zero";
+            std::string src = operands.size() > 1 ? operands[1] : "%c1";
+            L.OS << "      // PTX_SHFL: shfl.sync\n";
+            L.OS << "      " << v << " = nvvm.shfl.sync.down 0xffffffff, " << val << ", " << src << " : f32\n";
+            return;
+        }
+        if (asmStr.find("bar.sync") != std::string::npos) {
+            L.OS << "      // PTX_BAR: bar.sync\n";
+            L.OS << "      gpu.barrier\n";
+            return;
+        }
+        if (asmStr.find("fma.rn.f32") != std::string::npos) {
+            std::string v = "%" + std::to_string(TempVarCounter++);
+            std::string a = operands.size() > 0 ? operands[0] : "%zero";
+            std::string b = operands.size() > 1 ? operands[1] : "%zero";
+            std::string c = operands.size() > 2 ? operands[2] : "%zero";
+            std::string mul = "%" + std::to_string(TempVarCounter++);
+            L.OS << "      // PTX_FMA: fma.rn.f32\n";
+            L.OS << "      " << mul << " = arith.mulf " << a << ", " << b << " : f32\n";
+            L.OS << "      " << v << " = arith.addf " << mul << ", " << c << " : f32\n";
+            return;
+        }
+        if (asmStr.find("mov.b32") != std::string::npos) {
+            if (!operands.empty()) {
+                std::string v = "%" + std::to_string(TempVarCounter++);
+                L.OS << "      // PTX_MOV: mov.b32\n";
+                L.OS << "      " << v << " = arith.addi " << operands[0] << ", %c0 : index\n";
+            }
+            return;
+        }
+        if (asmStr.find("ld.global") != std::string::npos) {
+            L.OS << "      // PTX_LD_GLOBAL: " << asmStr.substr(0, 40) << "\n";
+            return;
+        }
+        if (asmStr.find("st.global") != std::string::npos) {
+            L.OS << "      // PTX_ST_GLOBAL: " << asmStr.substr(0, 40) << "\n";
+            return;
+        }
+        L.OS << "      // PTX_UNSUPPORTED: " << asmStr.substr(0, 60) << "\n";
         return;
     }
 
