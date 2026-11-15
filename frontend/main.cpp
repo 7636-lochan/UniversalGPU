@@ -300,7 +300,7 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
     if (!S) return;
 
     // ═══════════════════════════════════════════════════════════════
-    // MONTH 1: Inline PTX Interception (Top 5 Instructions)
+    // Inline PTX Interception (20 Instructions)
     // ═══════════════════════════════════════════════════════════════
     if (auto *Asm = dyn_cast<GCCAsmStmt>(S)) {
         std::string asmStr = Asm->getAsmString();
@@ -309,13 +309,30 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
             operands.push_back(translateExpr(Asm->getInputExpr(i), L));
         for (unsigned i = 0; i < Asm->getNumOutputs(); i++)
             operands.push_back(translateExpr(Asm->getOutputExpr(i), L));
+        
+        auto op = [&](int i, const std::string &fallback) {
+            return i < (int)operands.size() ? operands[i] : fallback;
+        };
+        std::string v = "%" + std::to_string(TempVarCounter++);
 
+        if (asmStr.find("shfl.sync.down") != std::string::npos) {
+            L.OS << "      // PTX_SHFL_DOWN: shfl.sync.down\n";
+            L.OS << "      " << v << " = nvvm.shfl.sync.down 0xffffffff, " << op(0, "%zero") << ", " << op(1, "%c1") << " : f32\n";
+            return;
+        }
+        if (asmStr.find("shfl.sync.up") != std::string::npos) {
+            L.OS << "      // PTX_SHFL_UP: shfl.sync.up\n";
+            L.OS << "      " << v << " = nvvm.shfl.sync.up 0xffffffff, " << op(0, "%zero") << ", " << op(1, "%c1") << " : f32\n";
+            return;
+        }
+        if (asmStr.find("shfl.sync.bfly") != std::string::npos) {
+            L.OS << "      // PTX_SHFL_BFLY: shfl.sync.bfly\n";
+            L.OS << "      " << v << " = nvvm.shfl.sync.bfly 0xffffffff, " << op(0, "%zero") << ", " << op(1, "%c1") << " : f32\n";
+            return;
+        }
         if (asmStr.find("shfl.sync") != std::string::npos) {
-            std::string v = "%" + std::to_string(TempVarCounter++);
-            std::string val = operands.size() > 0 ? operands[0] : "%zero";
-            std::string src = operands.size() > 1 ? operands[1] : "%c1";
             L.OS << "      // PTX_SHFL: shfl.sync\n";
-            L.OS << "      " << v << " = nvvm.shfl.sync.down 0xffffffff, " << val << ", " << src << " : f32\n";
+            L.OS << "      " << v << " = nvvm.shfl.sync.down 0xffffffff, " << op(0, "%zero") << ", " << op(1, "%c1") << " : f32\n";
             return;
         }
         if (asmStr.find("bar.sync") != std::string::npos) {
@@ -324,30 +341,110 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
             return;
         }
         if (asmStr.find("fma.rn.f32") != std::string::npos) {
-            std::string v = "%" + std::to_string(TempVarCounter++);
-            std::string a = operands.size() > 0 ? operands[0] : "%zero";
-            std::string b = operands.size() > 1 ? operands[1] : "%zero";
-            std::string c = operands.size() > 2 ? operands[2] : "%zero";
             std::string mul = "%" + std::to_string(TempVarCounter++);
             L.OS << "      // PTX_FMA: fma.rn.f32\n";
-            L.OS << "      " << mul << " = arith.mulf " << a << ", " << b << " : f32\n";
-            L.OS << "      " << v << " = arith.addf " << mul << ", " << c << " : f32\n";
+            L.OS << "      " << mul << " = arith.mulf " << op(0, "%f0") << ", " << op(1, "%f0") << " : f32\n";
+            L.OS << "      " << v << " = arith.addf " << mul << ", " << op(2, "%f0") << " : f32\n";
             return;
         }
-        if (asmStr.find("mov.b32") != std::string::npos) {
-            if (!operands.empty()) {
-                std::string v = "%" + std::to_string(TempVarCounter++);
-                L.OS << "      // PTX_MOV: mov.b32\n";
-                L.OS << "      " << v << " = arith.addi " << operands[0] << ", %c0 : index\n";
-            }
+        if (asmStr.find("mad.lo.s32") != std::string::npos || asmStr.find("mad.lo.u32") != std::string::npos) {
+            std::string mul = "%" + std::to_string(TempVarCounter++);
+            L.OS << "      // PTX_MAD: mad.lo.s32\n";
+            L.OS << "      " << mul << " = arith.muli " << op(0, "%c0") << ", " << op(1, "%c0") << " : index\n";
+            L.OS << "      " << v << " = arith.addi " << mul << ", " << op(2, "%c0") << " : index\n";
+            return;
+        }
+        if (asmStr.find("ld.global.f32") != std::string::npos) {
+            L.OS << "      // PTX_LD_GLOBAL_F32\n";
+            L.OS << "      " << v << " = memref.load %input[" << op(0, "%c0") << "] : memref<?xf32>\n";
+            return;
+        }
+        if (asmStr.find("ld.shared.f32") != std::string::npos) {
+            L.OS << "      // PTX_LD_SHARED_F32\n";
+            L.OS << "      " << v << " = memref.load %tile[" << op(0, "%c0") << "] : memref<?xf32>\n";
             return;
         }
         if (asmStr.find("ld.global") != std::string::npos) {
             L.OS << "      // PTX_LD_GLOBAL: " << asmStr.substr(0, 40) << "\n";
             return;
         }
+        if (asmStr.find("st.global.f32") != std::string::npos) {
+            L.OS << "      // PTX_ST_GLOBAL_F32\n";
+            L.OS << "      memref.store " << op(0, "%f0") << ", %output[" << op(1, "%c0") << "] : memref<?xf32>\n";
+            return;
+        }
+        if (asmStr.find("st.shared.f32") != std::string::npos) {
+            L.OS << "      // PTX_ST_SHARED_F32\n";
+            L.OS << "      memref.store " << op(0, "%f0") << ", %tile[" << op(1, "%c0") << "] : memref<?xf32>\n";
+            return;
+        }
         if (asmStr.find("st.global") != std::string::npos) {
             L.OS << "      // PTX_ST_GLOBAL: " << asmStr.substr(0, 40) << "\n";
+            return;
+        }
+        if (asmStr.find("mov.b32") != std::string::npos) {
+            L.OS << "      // PTX_MOV_B32\n";
+            L.OS << "      " << v << " = arith.addi " << op(0, "%c0") << ", %c0 : index\n";
+            return;
+        }
+        if (asmStr.find("mov.f32") != std::string::npos) {
+            L.OS << "      // PTX_MOV_F32\n";
+            L.OS << "      " << v << " = arith.addf " << op(0, "%f0") << ", %f0 : f32\n";
+            return;
+        }
+        if (asmStr.find("mov.b64") != std::string::npos || asmStr.find("mov.u64") != std::string::npos) {
+            L.OS << "      // PTX_MOV_B64\n";
+            L.OS << "      " << v << " = arith.addi " << op(0, "%c0") << ", %c0 : index\n";
+            return;
+        }
+        if (asmStr.find("setp.lt.f32") != std::string::npos) {
+            L.OS << "      // PTX_SETP_LT_F32\n";
+            L.OS << "      " << v << " = arith.cmpf olt, " << op(0, "%f0") << ", " << op(1, "%f0") << " : f32\n";
+            return;
+        }
+        if (asmStr.find("setp.eq.f32") != std::string::npos) {
+            L.OS << "      // PTX_SETP_EQ_F32\n";
+            L.OS << "      " << v << " = arith.cmpf oeq, " << op(0, "%f0") << ", " << op(1, "%f0") << " : f32\n";
+            return;
+        }
+        if (asmStr.find("setp.lt.s32") != std::string::npos || asmStr.find("setp.lt.u32") != std::string::npos) {
+            L.OS << "      // PTX_SETP_LT_S32\n";
+            L.OS << "      " << v << " = arith.cmpi slt, " << op(0, "%c0") << ", " << op(1, "%c0") << " : index\n";
+            return;
+        }
+        if (asmStr.find("setp.eq.s32") != std::string::npos || asmStr.find("setp.eq.u32") != std::string::npos) {
+            L.OS << "      // PTX_SETP_EQ_S32\n";
+            L.OS << "      " << v << " = arith.cmpi eq, " << op(0, "%c0") << ", " << op(1, "%c0") << " : index\n";
+            return;
+        }
+        if (asmStr.find("selp.f32") != std::string::npos) {
+            L.OS << "      // PTX_SELP_F32\n";
+            L.OS << "      " << v << " = arith.select " << op(2, "%false") << ", " << op(0, "%f0") << ", " << op(1, "%f0") << " : f32\n";
+            return;
+        }
+        if (asmStr.find("and.b32") != std::string::npos) {
+            L.OS << "      // PTX_AND_B32\n";
+            L.OS << "      " << v << " = arith.andi " << op(0, "%c0") << ", " << op(1, "%c0") << " : index\n";
+            return;
+        }
+        if (asmStr.find("or.b32") != std::string::npos) {
+            L.OS << "      // PTX_OR_B32\n";
+            L.OS << "      " << v << " = arith.ori " << op(0, "%c0") << ", " << op(1, "%c0") << " : index\n";
+            return;
+        }
+        if (asmStr.find("xor.b32") != std::string::npos) {
+            L.OS << "      // PTX_XOR_B32\n";
+            L.OS << "      " << v << " = arith.xori " << op(0, "%c0") << ", " << op(1, "%c0") << " : index\n";
+            return;
+        }
+        if (asmStr.find("shl.b32") != std::string::npos) {
+            L.OS << "      // PTX_SHL_B32\n";
+            L.OS << "      " << v << " = arith.shli " << op(0, "%c0") << ", " << op(1, "%c0") << " : index\n";
+            return;
+        }
+        if (asmStr.find("shr.b32") != std::string::npos) {
+            L.OS << "      // PTX_SHR_B32\n";
+            L.OS << "      " << v << " = arith.shrsi " << op(0, "%c0") << ", " << op(1, "%c0") << " : index\n";
             return;
         }
         L.OS << "      // PTX_UNSUPPORTED: " << asmStr.substr(0, 60) << "\n";
