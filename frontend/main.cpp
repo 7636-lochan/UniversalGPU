@@ -105,12 +105,32 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
                 }
                 return val;
             }
-            if (name == "__shfl_sync" && CE->getNumArgs() >= 3) {
+            // Handle __shfl_sync, __shfl_down_sync, __shfl_up_sync
+            if ((name == "__shfl_sync" || name == "__shfl_down_sync" || name == "__shfl_up_sync") && CE->getNumArgs() >= 3) {
                 std::string mask = translateExpr(CE->getArg(0), L);
                 std::string val = translateExpr(CE->getArg(1), L);
                 std::string src = translateExpr(CE->getArg(2), L);
                 std::string v = "%" + std::to_string(TempVarCounter++);
-                L.OS << "      " << v << " = nvvm.shfl.sync.down " << mask << ", " << val << ", " << src << " : f32\n";
+                if (WarpSize == 32) {
+                    L.OS << "      " << v << " = nvvm.shfl.sync.down " << mask << ", " << val << ", " << src << " : f32\n";
+                } else {
+                    std::string lane = "%lane_" + std::to_string(TempVarCounter++);
+                    std::string half = "%half_" + std::to_string(TempVarCounter++);
+                    std::string src_half = "%src_half_" + std::to_string(TempVarCounter++);
+                    std::string same_half = "%same_half_" + std::to_string(TempVarCounter++);
+                    std::string shfl_res = "%shfl_" + std::to_string(TempVarCounter++);
+                    L.OS << "      // WARP_EMULATION: AMD 64-lane wavefront, 32-lane logical warp\n";
+                    L.OS << "      " << lane << " = arith.remsi %tx, %c32 : index\n";
+                    L.OS << "      " << half << " = arith.divsi %tx, %c32 : index\n";
+                    L.OS << "      " << src_half << " = arith.divsi " << src << ", %c32 : index\n";
+                    L.OS << "      " << same_half << " = arith.cmpi eq, " << half << ", " << src_half << " : index\n";
+                    L.OS << "      " << v << " = scf.if " << same_half << " -> (f32) {\n";
+                    L.OS << "        " << shfl_res << " = nvvm.shfl.sync.down " << mask << ", " << val << ", " << src << " : f32\n";
+                    L.OS << "        scf.yield " << shfl_res << " : f32\n";
+                    L.OS << "      } else {\n";
+                    L.OS << "        scf.yield " << val << " : f32\n";
+                    L.OS << "      }\n";
+                }
                 return v;
             }
         }
@@ -140,7 +160,7 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
 
     if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
         std::string name = DRE->getDecl()->getNameAsString();
-        if (name == "i" || name == "k" || name == "iv") return "%iv";
+        if (name == "i" || name == "k" || name == "iv" || name == "offset") return "%iv";
         return L.lookup(name);
     }
 
@@ -299,9 +319,6 @@ BinaryOperator *findPlainAccumulation(Stmt *S) {
 void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
     if (!S) return;
 
-    // ═══════════════════════════════════════════════════════════════
-    // Inline PTX Interception (20 Instructions)
-    // ═══════════════════════════════════════════════════════════════
     if (auto *Asm = dyn_cast<GCCAsmStmt>(S)) {
         std::string asmStr = Asm->getAsmString();
         std::vector<std::string> operands;
@@ -309,30 +326,57 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
             operands.push_back(translateExpr(Asm->getInputExpr(i), L));
         for (unsigned i = 0; i < Asm->getNumOutputs(); i++)
             operands.push_back(translateExpr(Asm->getOutputExpr(i), L));
-        
         auto op = [&](int i, const std::string &fallback) {
             return i < (int)operands.size() ? operands[i] : fallback;
         };
         std::string v = "%" + std::to_string(TempVarCounter++);
 
         if (asmStr.find("shfl.sync.down") != std::string::npos) {
-            L.OS << "      // PTX_SHFL_DOWN: shfl.sync.down\n";
-            L.OS << "      " << v << " = nvvm.shfl.sync.down 0xffffffff, " << op(0, "%zero") << ", " << op(1, "%c1") << " : f32\n";
-            return;
-        }
-        if (asmStr.find("shfl.sync.up") != std::string::npos) {
-            L.OS << "      // PTX_SHFL_UP: shfl.sync.up\n";
-            L.OS << "      " << v << " = nvvm.shfl.sync.up 0xffffffff, " << op(0, "%zero") << ", " << op(1, "%c1") << " : f32\n";
-            return;
-        }
-        if (asmStr.find("shfl.sync.bfly") != std::string::npos) {
-            L.OS << "      // PTX_SHFL_BFLY: shfl.sync.bfly\n";
-            L.OS << "      " << v << " = nvvm.shfl.sync.bfly 0xffffffff, " << op(0, "%zero") << ", " << op(1, "%c1") << " : f32\n";
+            if (WarpSize == 32) {
+                L.OS << "      // PTX_SHFL_DOWN: shfl.sync.down (native)\n";
+                L.OS << "      " << v << " = nvvm.shfl.sync.down 0xffffffff, " << op(0, "%zero") << ", " << op(1, "%c1") << " : f32\n";
+            } else {
+                L.OS << "      // WARP_EMULATION: shfl.sync.down masked to 32-lane half\n";
+                std::string lane = "%lane_" + std::to_string(TempVarCounter++);
+                std::string half = "%half_" + std::to_string(TempVarCounter++);
+                std::string src_half = "%src_half_" + std::to_string(TempVarCounter++);
+                std::string same_half = "%same_half_" + std::to_string(TempVarCounter++);
+                std::string shfl_res = "%shfl_" + std::to_string(TempVarCounter++);
+                L.OS << "      " << lane << " = arith.remsi %tx, %c32 : index\n";
+                L.OS << "      " << half << " = arith.divsi %tx, %c32 : index\n";
+                L.OS << "      " << src_half << " = arith.divsi " << op(1, "%c1") << ", %c32 : index\n";
+                L.OS << "      " << same_half << " = arith.cmpi eq, " << half << ", " << src_half << " : index\n";
+                L.OS << "      " << v << " = scf.if " << same_half << " -> (f32) {\n";
+                L.OS << "        " << shfl_res << " = nvvm.shfl.sync.down 0xffffffff, " << op(0, "%zero") << ", " << op(1, "%c1") << " : f32\n";
+                L.OS << "        scf.yield " << shfl_res << " : f32\n";
+                L.OS << "      } else {\n";
+                L.OS << "        scf.yield " << op(0, "%zero") << " : f32\n";
+                L.OS << "      }\n";
+            }
             return;
         }
         if (asmStr.find("shfl.sync") != std::string::npos) {
-            L.OS << "      // PTX_SHFL: shfl.sync\n";
-            L.OS << "      " << v << " = nvvm.shfl.sync.down 0xffffffff, " << op(0, "%zero") << ", " << op(1, "%c1") << " : f32\n";
+            if (WarpSize == 32) {
+                L.OS << "      // PTX_SHFL: shfl.sync (native)\n";
+                L.OS << "      " << v << " = nvvm.shfl.sync.down 0xffffffff, " << op(0, "%zero") << ", " << op(1, "%c1") << " : f32\n";
+            } else {
+                L.OS << "      // WARP_EMULATION: shfl.sync masked to 32-lane half\n";
+                std::string lane = "%lane_" + std::to_string(TempVarCounter++);
+                std::string half = "%half_" + std::to_string(TempVarCounter++);
+                std::string src_half = "%src_half_" + std::to_string(TempVarCounter++);
+                std::string same_half = "%same_half_" + std::to_string(TempVarCounter++);
+                std::string shfl_res = "%shfl_" + std::to_string(TempVarCounter++);
+                L.OS << "      " << lane << " = arith.remsi %tx, %c32 : index\n";
+                L.OS << "      " << half << " = arith.divsi %tx, %c32 : index\n";
+                L.OS << "      " << src_half << " = arith.divsi " << op(1, "%c1") << ", %c32 : index\n";
+                L.OS << "      " << same_half << " = arith.cmpi eq, " << half << ", " << src_half << " : index\n";
+                L.OS << "      " << v << " = scf.if " << same_half << " -> (f32) {\n";
+                L.OS << "        " << shfl_res << " = nvvm.shfl.sync.down 0xffffffff, " << op(0, "%zero") << ", " << op(1, "%c1") << " : f32\n";
+                L.OS << "        scf.yield " << shfl_res << " : f32\n";
+                L.OS << "      } else {\n";
+                L.OS << "        scf.yield " << op(0, "%zero") << " : f32\n";
+                L.OS << "      }\n";
+            }
             return;
         }
         if (asmStr.find("bar.sync") != std::string::npos) {
