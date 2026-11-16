@@ -43,3 +43,11 @@ MIT
 ## Inline PTX Instructions Supported (20)
 
 shfl.sync.down, shfl.sync.up, shfl.sync.bfly, shfl.sync, bar.sync, fma.rn.f32, mad.lo.s32, mad.lo.u32, ld.global.f32, ld.shared.f32, ld.global, st.global.f32, st.shared.f32, st.global, mov.b32, mov.f32, mov.b64, mov.u64, setp.lt.f32, setp.eq.f32, setp.lt.s32, setp.lt.u32, setp.eq.s32, setp.eq.u32, selp.f32, and.b32, or.b32, xor.b32, shl.b32, shr.b32
+
+## Warp32 Emulation
+
+The `--warp-size=64` flag (for AMD CDNA) implements warp32 emulation:
+- Computes `lane = tx % 32` and `half = tx / 32`
+- Masks `shfl.sync` with `scf.if` to stay within the 32-lane half
+- Preserves CUDA's 32-thread logical warp semantics on 64-lane AMD wavefronts
+- Needs validation on real AMD hardware (MI200/MI300)
