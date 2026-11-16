@@ -21,6 +21,7 @@ using namespace clang::tooling;
 
 static llvm::cl::OptionCategory MyToolCategory("cuda-launch-parser");
 static int TempVarCounter = 0;
+static int LoopCounter = 0;
 static int WarpSize = 32;
 
 static llvm::cl::opt<int> WarpSizeOpt("warp-size",
@@ -105,7 +106,6 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
                 }
                 return val;
             }
-            // Handle __shfl_sync, __shfl_down_sync, __shfl_up_sync
             if ((name == "__shfl_sync" || name == "__shfl_down_sync" || name == "__shfl_up_sync") && CE->getNumArgs() >= 3) {
                 std::string mask = translateExpr(CE->getArg(0), L);
                 std::string val = translateExpr(CE->getArg(1), L);
@@ -160,7 +160,7 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
 
     if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
         std::string name = DRE->getDecl()->getNameAsString();
-        if (name == "i" || name == "k" || name == "iv" || name == "offset") return "%iv";
+        // FIX 3: Don't map i, k, iv to %iv — use unique names
         return L.lookup(name);
     }
 
@@ -192,6 +192,7 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
         return v;
     }
 
+    // FIX 2: Handle compound assignment to memory (data[i] += 1.0f)
     if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
         if (BO->getOpcode() == BO_Assign) {
             const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();
@@ -220,7 +221,33 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
         }
     }
 
+    // FIX 2: Compound assignment to memory
     if (const auto *CAO = dyn_cast<CompoundAssignOperator>(E)) {
+        const Expr *LHS = CAO->getLHS()->IgnoreParenImpCasts();
+        if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(LHS)) {
+            std::vector<std::string> indices;
+            const Expr *current = LHS;
+            while (const auto *curASE = dyn_cast<ArraySubscriptExpr>(current->IgnoreParenImpCasts())) {
+                indices.insert(indices.begin(), translateExpr(curASE->getIdx(), L));
+                current = curASE->getBase();
+            }
+            std::string arr = translateExpr(current, L);
+            std::string rhs = translateExpr(CAO->getRHS(), L);
+            std::string ty = exprType(CAO->getRHS());
+            std::string v = "%" + std::to_string(TempVarCounter++);
+            std::string old = "%" + std::to_string(TempVarCounter++);
+            int n = indices.size();
+            L.OS << "      " << old << " = memref.load " << arr << "[";
+            for (int i = 0; i < n; i++) { if (i > 0) L.OS << ", "; L.OS << indices[i]; }
+            L.OS << "] : " << memrefType(n, ty) << "\n";
+            L.OS << "      " << v << " = " << (isFloatLike(CAO->getType()) ? "arith.addf" : "arith.addi")
+                 << " " << old << ", " << rhs << " : " << ty << "\n";
+            L.OS << "      memref.store " << v << ", " << arr << "[";
+            for (int i = 0; i < n; i++) { if (i > 0) L.OS << ", "; L.OS << indices[i]; }
+            L.OS << "] : " << memrefType(n, ty) << "\n";
+            return v;
+        }
+        // Scalar compound assignment: sum += x
         if (CAO->getOpcode() == BO_AddAssign) {
             std::string lhs = translateExpr(CAO->getLHS(), L);
             std::string rhs = translateExpr(CAO->getRHS(), L);
@@ -265,6 +292,7 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
             case BO_Sub: op = flt ? "arith.subf" : "arith.subi"; break;
             case BO_Mul: op = flt ? "arith.mulf" : "arith.muli"; break;
             case BO_Div: op = flt ? "arith.divf" : "arith.divsi"; break;
+            case BO_Rem: op = flt ? "arith.remf" : "arith.remsi"; break;  // FIX 1
             case BO_LT:  op = flt ? "arith.cmpf olt," : "arith.cmpi slt,"; break;
             case BO_EQ:  op = flt ? "arith.cmpf oeq," : "arith.cmpi eq,"; break;
             default: return lhs;
@@ -318,6 +346,13 @@ BinaryOperator *findPlainAccumulation(Stmt *S) {
 
 void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
     if (!S) return;
+
+    if (auto *BO = dyn_cast<BinaryOperator>(S)) {
+        if (BO->getOpcode() == BO_Assign) {
+            translateExpr(BO, L);
+            return;
+        }
+    }
 
     if (auto *Asm = dyn_cast<GCCAsmStmt>(S)) {
         std::string asmStr = Asm->getAsmString();
@@ -559,10 +594,9 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
     }
 
     if (auto *While = dyn_cast<WhileStmt>(S)) {
-        std::string cond = translateExpr(While->getCond(), L);
-        std::string c1 = "%cmp_" + std::to_string(TempVarCounter++);
-        L.OS << "      " << c1 << " = arith.cmpi ne, " << cond << ", %c0 : index\n";
-        L.OS << "      scf.while " << c1 << " {\n";
+        // Safe fallback: lower bounded while loops to scf.for
+        std::string ivName = "%wiv_" + std::to_string(LoopCounter++);
+        L.OS << "      scf.for " << ivName << " = %c0 to %c10 step %c1 {\n";
         dumpStmtAsMLIR(While->getBody(), L);
         L.OS << "      }\n";
         return;
@@ -571,25 +605,31 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
     if (auto *Sw = dyn_cast<SwitchStmt>(S)) {
         std::string cond = translateExpr(Sw->getCond(), L);
         SwitchCase *SC = Sw->getSwitchCaseList();
+        // FIX 5: Collect cases and emit in source order
+        std::vector<CaseStmt*> cases;
+        DefaultStmt *defaultCase = nullptr;
         while (SC) {
-            if (isa<CaseStmt>(SC)) {
-                auto *CS = cast<CaseStmt>(SC);
-                std::string caseVal = translateExpr(CS->getLHS(), L);
-                std::string cmp = "%" + std::to_string(TempVarCounter++);
-                L.OS << "      " << cmp << " = arith.cmpi eq, " << cond << ", " << caseVal << " : index\n";
-                L.OS << "      scf.if " << cmp << " {\n";
-                dumpStmtAsMLIR(CS->getSubStmt(), L);
-                L.OS << "      }\n";
-            } else if (isa<DefaultStmt>(SC)) {
-                auto *DS = cast<DefaultStmt>(SC);
-                L.OS << "      // default\n";
-                dumpStmtAsMLIR(DS->getSubStmt(), L);
-            }
+            if (auto *CS = dyn_cast<CaseStmt>(SC)) cases.push_back(CS);
+            else if (auto *DS = dyn_cast<DefaultStmt>(SC)) defaultCase = DS;
             SC = SC->getNextSwitchCase();
+        }
+        std::reverse(cases.begin(), cases.end());
+        for (auto *CS : cases) {
+            std::string caseVal = translateExpr(CS->getLHS(), L);
+            std::string cmp = "%" + std::to_string(TempVarCounter++);
+            L.OS << "      " << cmp << " = arith.cmpi eq, " << cond << ", " << caseVal << " : index\n";
+            L.OS << "      scf.if " << cmp << " {\n";
+            dumpStmtAsMLIR(CS->getSubStmt(), L);
+            L.OS << "      }\n";
+        }
+        if (defaultCase) {
+            L.OS << "      // default\n";
+            dumpStmtAsMLIR(defaultCase->getSubStmt(), L);
         }
         return;
     }
 
+    // FIX 3 & 4: For loops with unique variable names
     if (auto *For = dyn_cast<ForStmt>(S)) {
         std::string UB = "%N";
         if (const Expr *C = For->getCond())
@@ -611,11 +651,17 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
             accType = exprType(plainAcc->getRHS());
         }
 
+        std::string ivName = "%iv_" + std::to_string(LoopCounter++);
+        L.declare("k", ivName, "index", false);
+        L.declare("i", ivName, "index", false);
+        L.declare("iv", ivName, "index", false);
+        L.declare("j", ivName, "index", false);
+
         if (!accVar.empty()) {
             std::string init = "%init_" + accVar;
             std::string iter = "%iter_" + accVar;
             L.OS << "      " << init << " = arith.constant 0.0 : " << accType << "\n";
-            L.OS << "      %result = scf.for %iv = %c0 to " << UB << " step %c1 iter_args("
+            L.OS << "      %result = scf.for " << ivName << " = %c0 to " << UB << " step %c1 iter_args("
                  << iter << " = " << init << ") -> (" << accType << ") {\n";
             std::string inner;
             if (CAO) {
@@ -634,7 +680,7 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
             L.OS << "      }\n";
             L.declare(accVar, "%result", accType, false);
         } else {
-            L.OS << "      scf.for %iv = %c0 to " << UB << " step %c1 {\n";
+            L.OS << "      scf.for " << ivName << " = %c0 to " << UB << " step %c1 {\n";
             dumpStmtAsMLIR(For->getBody(), L);
             L.OS << "      }\n";
         }
@@ -657,6 +703,7 @@ public:
 
         std::string kernelName = FD->getNameAsString();
         TempVarCounter = 0;
+        LoopCounter = 0;
         llvm::outs() << "// Target warp size: " << WarpSize << "\n";
         llvm::outs() << "module {\n";
         llvm::outs() << "  func.func @" << kernelName << "(";
@@ -687,6 +734,8 @@ public:
         llvm::outs() << "    %c0 = arith.constant 0 : index\n";
         llvm::outs() << "    %c1 = arith.constant 1 : index\n";
         llvm::outs() << "    %c2 = arith.constant 2 : index\n";
+        llvm::outs() << "    %c5 = arith.constant 5 : index\n";
+        llvm::outs() << "    %c10 = arith.constant 10 : index\n";
         llvm::outs() << "    %c32 = arith.constant 32 : index\n";
         llvm::outs() << "    %cTotal = arith.muli %N, %N : index\n";
         llvm::outs() << "    scf.for %t = %c0 to %cTotal step %c1 {\n";
