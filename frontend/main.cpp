@@ -347,12 +347,19 @@ BinaryOperator *findPlainAccumulation(Stmt *S) {
 void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
     if (!S) return;
 
-    if (auto *BO = dyn_cast<BinaryOperator>(S)) {
-        if (BO->getOpcode() == BO_Assign) {
-            translateExpr(BO, L);
-            return;
+        // Skip j++ inside while loop body (handled by scf.yield)
+        if (auto *UO = dyn_cast<UnaryOperator>(S)) {
+            if (UO->getOpcode() == UO_PostInc || UO->getOpcode() == UO_PreInc) {
+                return;
+            }
         }
-    }
+    
+        if (auto *BO = dyn_cast<BinaryOperator>(S)) {
+            if (BO->getOpcode() == BO_Assign) {
+                translateExpr(BO, L);
+                return;
+            }
+        }
 
     if (auto *Asm = dyn_cast<GCCAsmStmt>(S)) {
         std::string asmStr = Asm->getAsmString();
@@ -594,11 +601,37 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
     }
 
     if (auto *While = dyn_cast<WhileStmt>(S)) {
-        // Safe fallback: lower bounded while loops to scf.for
-        std::string ivName = "%wiv_" + std::to_string(LoopCounter++);
-        L.OS << "      scf.for " << ivName << " = %c0 to %c10 step %c1 {\n";
+        std::string varName = "j";
+        std::string varMlir = "%while_j_" + std::to_string(LoopCounter);
+        
+        const Expr *cond = While->getCond()->IgnoreParenImpCasts();
+        std::string ub = "%c10";
+        std::string cmpOp = "slt";
+        if (const auto *BO = dyn_cast<BinaryOperator>(cond)) {
+            std::string rhs = translateExpr(BO->getRHS(), L);
+            ub = rhs;
+            if (BO->getOpcode() == BO_LT) cmpOp = "slt";
+            else if (BO->getOpcode() == BO_NE) cmpOp = "ne";
+        }
+        
+        L.OS << "      %while_result_" << LoopCounter << " = scf.while (" 
+             << varMlir << " = %c0) : (index) -> index {\n";
+        L.OS << "        %cond_" << LoopCounter << " = arith.cmpi " 
+             << cmpOp << ", " << varMlir << ", " << ub << " : index\n";
+        L.OS << "        scf.condition(%cond_" << LoopCounter << ") " 
+             << varMlir << " : index\n";
+        L.OS << "      } do {\n";
+        L.OS << "        ^bb0(%arg_j: index):\n";
+        
+        L.declare(varName, "%arg_j", "index", false);
         dumpStmtAsMLIR(While->getBody(), L);
+        
+        L.OS << "        %next_j_" << LoopCounter << " = arith.addi %arg_j, %c1 : index\n";
+        L.OS << "        scf.yield %next_j_" << LoopCounter << " : index\n";
         L.OS << "      }\n";
+        
+        L.declare(varName, varMlir, "index", false);
+        LoopCounter++;
         return;
     }
 
