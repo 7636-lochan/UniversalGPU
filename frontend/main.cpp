@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <set>
 
 using namespace clang;
 using namespace clang::tooling;
@@ -24,6 +25,10 @@ static llvm::cl::OptionCategory MyToolCategory("cuda-launch-parser");
 static int TempVarCounter = 0;
 static int LoopCounter = 0;
 static int WarpSize = 32;
+
+// GLOBAL REGISTRY: persists across all translation units
+static std::set<std::string> EmittedFunctions;
+static std::vector<std::string> FunctionBodies;
 
 static llvm::cl::opt<int> WarpSizeOpt("warp-size",
     llvm::cl::desc("Target warp size: 32 for NVIDIA, 64 for AMD CDNA"),
@@ -87,7 +92,6 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
         if (const auto *FD = CE->getDirectCallee()) {
             std::string name = FD->getNameAsString();
             
-            // __device__ function calls
             if (FD->hasAttr<CUDADeviceAttr>() && !FD->hasAttr<CUDAGlobalAttr>()) {
                 std::string args;
                 for (unsigned i = 0; i < CE->getNumArgs(); i++) {
@@ -134,19 +138,17 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
                 if (WarpSize == 32) {
                     L.OS << "      " << v << " = nvvm.shfl.sync.down " << mask << ", " << val << ", " << src << " : f32\n";
                 } else {
-                    std::string lane = "%lane_" + std::to_string(TempVarCounter++);
                     std::string half = "%half_" + std::to_string(TempVarCounter++);
                     std::string src_half = "%src_half_" + std::to_string(TempVarCounter++);
-                    std::string same_half = "%same_half_" + std::to_string(TempVarCounter++);
-                    std::string shfl_res = "%shfl_" + std::to_string(TempVarCounter++);
-                    L.OS << "      // WARP_EMULATION: AMD 64-lane wavefront, 32-lane logical warp\n";
-                    L.OS << "      " << lane << " = arith.remsi %tx, %c32 : index\n";
+                    std::string same = "%same_" + std::to_string(TempVarCounter++);
+                    std::string shfl = "%shfl_" + std::to_string(TempVarCounter++);
+                    L.OS << "      // WARP_EMULATION: 64-lane masked\n";
                     L.OS << "      " << half << " = arith.divsi %tx, %c32 : index\n";
                     L.OS << "      " << src_half << " = arith.divsi " << src << ", %c32 : index\n";
-                    L.OS << "      " << same_half << " = arith.cmpi eq, " << half << ", " << src_half << " : index\n";
-                    L.OS << "      " << v << " = scf.if " << same_half << " -> (f32) {\n";
-                    L.OS << "        " << shfl_res << " = nvvm.shfl.sync.down " << mask << ", " << val << ", " << src << " : f32\n";
-                    L.OS << "        scf.yield " << shfl_res << " : f32\n";
+                    L.OS << "      " << same << " = arith.cmpi eq, " << half << ", " << src_half << " : index\n";
+                    L.OS << "      " << v << " = scf.if " << same << " -> (f32) {\n";
+                    L.OS << "        " << shfl << " = nvvm.shfl.sync.down " << mask << ", " << val << ", " << src << " : f32\n";
+                    L.OS << "        scf.yield " << shfl << " : f32\n";
                     L.OS << "      } else {\n";
                     L.OS << "        scf.yield " << val << " : f32\n";
                     L.OS << "      }\n";
@@ -337,14 +339,11 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
     return "";
 }
 
-void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
+void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L, raw_ostream &OS) {
     if (!S) return;
 
-    // Skip j++ inside while loop body
     if (auto *UO = dyn_cast<UnaryOperator>(S)) {
-        if (UO->getOpcode() == UO_PostInc || UO->getOpcode() == UO_PreInc) {
-            return;
-        }
+        if (UO->getOpcode() == UO_PostInc || UO->getOpcode() == UO_PreInc) return;
     }
 
     if (auto *BO = dyn_cast<BinaryOperator>(S)) {
@@ -357,9 +356,9 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
     if (auto *Ret = dyn_cast<ReturnStmt>(S)) {
         if (Ret->getRetValue()) {
             std::string v = translateExpr(Ret->getRetValue(), L);
-            L.OS << "      return " << v << " : " << exprType(Ret->getRetValue()) << "\n";
+            OS << "      return " << v << " : " << exprType(Ret->getRetValue()) << "\n";
         } else {
-            L.OS << "      return\n";
+            OS << "      return\n";
         }
         return;
     }
@@ -378,80 +377,41 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
 
         if (asmStr.find("shfl.sync.down") != std::string::npos) {
             if (WarpSize == 32) {
-                L.OS << "      // PTX_SHFL_DOWN\n";
-                L.OS << "      " << v << " = nvvm.shfl.sync.down 0xffffffff, " << op(0, "%zero") << ", " << op(1, "%c1") << " : f32\n";
+                OS << "      " << v << " = nvvm.shfl.sync.down 0xffffffff, " << op(0, "%zero") << ", " << op(1, "%c1") << " : f32\n";
             } else {
-                L.OS << "      // WARP_EMULATION: masked shfl\n";
                 std::string half = "%half_" + std::to_string(TempVarCounter++);
                 std::string src_half = "%src_half_" + std::to_string(TempVarCounter++);
                 std::string same = "%same_" + std::to_string(TempVarCounter++);
                 std::string shfl = "%shfl_" + std::to_string(TempVarCounter++);
-                L.OS << "      " << half << " = arith.divsi %tx, %c32 : index\n";
-                L.OS << "      " << src_half << " = arith.divsi " << op(1, "%c1") << ", %c32 : index\n";
-                L.OS << "      " << same << " = arith.cmpi eq, " << half << ", " << src_half << " : index\n";
-                L.OS << "      " << v << " = scf.if " << same << " -> (f32) {\n";
-                L.OS << "        " << shfl << " = nvvm.shfl.sync.down 0xffffffff, " << op(0, "%zero") << ", " << op(1, "%c1") << " : f32\n";
-                L.OS << "        scf.yield " << shfl << " : f32\n";
-                L.OS << "      } else {\n";
-                L.OS << "        scf.yield " << op(0, "%zero") << " : f32\n";
-                L.OS << "      }\n";
-            }
-            return;
-        }
-        if (asmStr.find("shfl.sync") != std::string::npos) {
-            if (WarpSize == 32) {
-                L.OS << "      // PTX_SHFL\n";
-                L.OS << "      " << v << " = nvvm.shfl.sync.down 0xffffffff, " << op(0, "%zero") << ", " << op(1, "%c1") << " : f32\n";
-            } else {
-                L.OS << "      // WARP_EMULATION\n";
-                std::string half = "%half_" + std::to_string(TempVarCounter++);
-                std::string src_half = "%src_half_" + std::to_string(TempVarCounter++);
-                std::string same = "%same_" + std::to_string(TempVarCounter++);
-                std::string shfl = "%shfl_" + std::to_string(TempVarCounter++);
-                L.OS << "      " << half << " = arith.divsi %tx, %c32 : index\n";
-                L.OS << "      " << src_half << " = arith.divsi " << op(1, "%c1") << ", %c32 : index\n";
-                L.OS << "      " << same << " = arith.cmpi eq, " << half << ", " << src_half << " : index\n";
-                L.OS << "      " << v << " = scf.if " << same << " -> (f32) {\n";
-                L.OS << "        " << shfl << " = nvvm.shfl.sync.down 0xffffffff, " << op(0, "%zero") << ", " << op(1, "%c1") << " : f32\n";
-                L.OS << "        scf.yield " << shfl << " : f32\n";
-                L.OS << "      } else {\n";
-                L.OS << "        scf.yield " << op(0, "%zero") << " : f32\n";
-                L.OS << "      }\n";
+                OS << "      " << half << " = arith.divsi %tx, %c32 : index\n";
+                OS << "      " << src_half << " = arith.divsi " << op(1, "%c1") << ", %c32 : index\n";
+                OS << "      " << same << " = arith.cmpi eq, " << half << ", " << src_half << " : index\n";
+                OS << "      " << v << " = scf.if " << same << " -> (f32) {\n";
+                OS << "        " << shfl << " = nvvm.shfl.sync.down 0xffffffff, " << op(0, "%zero") << ", " << op(1, "%c1") << " : f32\n";
+                OS << "        scf.yield " << shfl << " : f32\n";
+                OS << "      } else {\n";
+                OS << "        scf.yield " << op(0, "%zero") << " : f32\n";
+                OS << "      }\n";
             }
             return;
         }
         if (asmStr.find("bar.sync") != std::string::npos) {
-            L.OS << "      gpu.barrier\n";
+            OS << "      gpu.barrier\n";
             return;
         }
         if (asmStr.find("fma.rn.f32") != std::string::npos) {
             std::string mul = "%" + std::to_string(TempVarCounter++);
-            L.OS << "      " << mul << " = arith.mulf " << op(0, "%f0") << ", " << op(1, "%f0") << " : f32\n";
-            L.OS << "      " << v << " = arith.addf " << mul << ", " << op(2, "%f0") << " : f32\n";
+            OS << "      " << mul << " = arith.mulf " << op(0, "%f0") << ", " << op(1, "%f0") << " : f32\n";
+            OS << "      " << v << " = arith.addf " << mul << ", " << op(2, "%f0") << " : f32\n";
             return;
         }
-        L.OS << "      // PTX_UNSUPPORTED\n";
+        OS << "      // PTX_UNSUPPORTED\n";
         return;
     }
 
     if (auto *CE = dyn_cast<CallExpr>(S)) {
-        if (const auto *FD = CE->getDirectCallee()) {
-            if (FD->getNameAsString() == "atomicAdd" && CE->getNumArgs() >= 2) {
-                std::string val = translateExpr(CE->getArg(1), L);
-                std::string ty = exprType(CE->getArg(1));
-                const Expr *ptrE = CE->getArg(0)->IgnoreParenImpCasts();
-                if (const auto *UO = dyn_cast<UnaryOperator>(ptrE)) {
-                    if (UO->getOpcode() == UO_AddrOf) ptrE = UO->getSubExpr()->IgnoreParenImpCasts();
-                }
-                if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(ptrE)) {
-                    std::string arr = translateExpr(ASE->getBase(), L);
-                    std::string idx = translateExpr(ASE->getIdx(), L);
-                    L.OS << "      memref.atomic_rmw addf " << val << ", " << arr << "[" << idx
-                         << "] : (memref<?x" << ty << ">, " << ty << ") -> " << ty << "\n";
-                }
-                return;
-            }
-        }
+        translateExpr(CE, L);
+        return;
     }
 
     if (auto *DS = dyn_cast<DeclStmt>(S)) {
@@ -464,7 +424,7 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
                     if (baseType->isArrayType()) baseType = baseType->getAsArrayTypeUnsafe()->getElementType();
                     std::string t = mlirType(baseType);
                     L.declare(name, "%" + name, t, true, dims);
-                    L.OS << "      %" << name << " = memref.alloc() : memref<256x" << t << ">\n";
+                    OS << "      %" << name << " = memref.alloc() : memref<256x" << t << ">\n";
                 } else if (VD->hasInit()) {
                     std::string v = translateExpr(VD->getInit(), L);
                     int dims = pointerDepth(VD->getType());
@@ -473,7 +433,7 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
                 } else {
                     std::string t = mlirType(VD->getType());
                     std::string init = "%zero_" + name;
-                    L.OS << "      " << init << " = arith.constant 0.0 : " << t << "\n";
+                    OS << "      " << init << " = arith.constant 0.0 : " << t << "\n";
                     L.declare(name, init, t, false);
                 }
             }
@@ -484,21 +444,20 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
     if (auto *If = dyn_cast<IfStmt>(S)) {
         std::string cond = translateExpr(If->getCond(), L);
         std::string c1 = "%cmp_" + std::to_string(TempVarCounter++);
-        L.OS << "      " << c1 << " = arith.cmpi ne, " << cond << ", %c0 : index\n";
-        L.OS << "      scf.if " << c1 << " {\n";
-        dumpStmtAsMLIR(If->getThen(), L);
-        L.OS << "      }";
+        OS << "      " << c1 << " = arith.cmpi ne, " << cond << ", %c0 : index\n";
+        OS << "      scf.if " << c1 << " {\n";
+        dumpStmtAsMLIR(If->getThen(), L, OS);
+        OS << "      }";
         if (If->getElse()) {
-            L.OS << " else {\n";
-            dumpStmtAsMLIR(If->getElse(), L);
-            L.OS << "      }";
+            OS << " else {\n";
+            dumpStmtAsMLIR(If->getElse(), L, OS);
+            OS << "      }";
         }
-        L.OS << "\n";
+        OS << "\n";
         return;
     }
 
     if (auto *While = dyn_cast<WhileStmt>(S)) {
-        std::string varName = "j";
         std::string varMlir = "%while_j_" + std::to_string(LoopCounter);
         const Expr *cond = While->getCond()->IgnoreParenImpCasts();
         std::string ub = "%c10";
@@ -508,17 +467,16 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
             if (BO->getOpcode() == BO_LT) cmpOp = "slt";
             else if (BO->getOpcode() == BO_NE) cmpOp = "ne";
         }
-        L.OS << "      %while_result_" << LoopCounter << " = scf.while (" << varMlir << " = %c0) : (index) -> index {\n";
-        L.OS << "        %cond_" << LoopCounter << " = arith.cmpi " << cmpOp << ", " << varMlir << ", " << ub << " : index\n";
-        L.OS << "        scf.condition(%cond_" << LoopCounter << ") " << varMlir << " : index\n";
-        L.OS << "      } do {\n";
-        L.OS << "        ^bb0(%arg_j: index):\n";
-        L.declare(varName, "%arg_j", "index", false);
-        dumpStmtAsMLIR(While->getBody(), L);
-        L.OS << "        %next_j_" << LoopCounter << " = arith.addi %arg_j, %c1 : index\n";
-        L.OS << "        scf.yield %next_j_" << LoopCounter << " : index\n";
-        L.OS << "      }\n";
-        L.declare(varName, varMlir, "index", false);
+        OS << "      %while_result_" << LoopCounter << " = scf.while (" << varMlir << " = %c0) : (index) -> index {\n";
+        OS << "        %cond_" << LoopCounter << " = arith.cmpi " << cmpOp << ", " << varMlir << ", " << ub << " : index\n";
+        OS << "        scf.condition(%cond_" << LoopCounter << ") " << varMlir << " : index\n";
+        OS << "      } do {\n";
+        OS << "        ^bb0(%arg_j: index):\n";
+        L.declare("j", "%arg_j", "index", false);
+        dumpStmtAsMLIR(While->getBody(), L, OS);
+        OS << "        %next_j_" << LoopCounter << " = arith.addi %arg_j, %c1 : index\n";
+        OS << "        scf.yield %next_j_" << LoopCounter << " : index\n";
+        OS << "      }\n";
         LoopCounter++;
         return;
     }
@@ -537,14 +495,14 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
         for (auto *CS : cases) {
             std::string caseVal = translateExpr(CS->getLHS(), L);
             std::string cmp = "%" + std::to_string(TempVarCounter++);
-            L.OS << "      " << cmp << " = arith.cmpi eq, " << cond << ", " << caseVal << " : index\n";
-            L.OS << "      scf.if " << cmp << " {\n";
-            dumpStmtAsMLIR(CS->getSubStmt(), L);
-            L.OS << "      }\n";
+            OS << "      " << cmp << " = arith.cmpi eq, " << cond << ", " << caseVal << " : index\n";
+            OS << "      scf.if " << cmp << " {\n";
+            dumpStmtAsMLIR(CS->getSubStmt(), L, OS);
+            OS << "      }\n";
         }
         if (defaultCase) {
-            L.OS << "      // default\n";
-            dumpStmtAsMLIR(defaultCase->getSubStmt(), L);
+            OS << "      // default\n";
+            dumpStmtAsMLIR(defaultCase->getSubStmt(), L, OS);
         }
         return;
     }
@@ -558,15 +516,15 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L) {
         L.declare("k", ivName, "index", false);
         L.declare("i", ivName, "index", false);
         L.declare("iv", ivName, "index", false);
-        L.OS << "      scf.for " << ivName << " = %c0 to " << UB << " step %c1 {\n";
-        dumpStmtAsMLIR(For->getBody(), L);
-        L.OS << "      }\n";
+        OS << "      scf.for " << ivName << " = %c0 to " << UB << " step %c1 {\n";
+        dumpStmtAsMLIR(For->getBody(), L, OS);
+        OS << "      }\n";
         return;
     }
 
     for (Stmt *C : S->children()) {
         if (C && isa<Expr>(C)) translateExpr(cast<Expr>(C), L);
-        else dumpStmtAsMLIR(C, L);
+        else dumpStmtAsMLIR(C, L, OS);
     }
 }
 
@@ -574,19 +532,24 @@ class CudaLaunchVisitor : public RecursiveASTVisitor<CudaLaunchVisitor> {
 public:
     explicit CudaLaunchVisitor(ASTContext *Context) : Context(Context) {}
 
-    void emitKernel(FunctionDecl *FD) {
+    void emitKernelToBuffer(FunctionDecl *FD) {
         if (!FD || !FD->hasBody()) return;
         bool isDevice = FD->hasAttr<CUDADeviceAttr>() && !FD->hasAttr<CUDAGlobalAttr>();
         bool isGlobal = FD->hasAttr<CUDAGlobalAttr>();
         if (!isDevice && !isGlobal) return;
 
         std::string kernelName = FD->getNameAsString();
+        // Deduplicate: skip if already emitted
+        if (EmittedFunctions.count(kernelName)) return;
+        EmittedFunctions.insert(kernelName);
+
+        std::string buffer;
+        llvm::raw_string_ostream BufOS(buffer);
         TempVarCounter = 0;
         LoopCounter = 0;
-        llvm::outs() << "// Target warp size: " << WarpSize << "\n";
-        llvm::outs() << "module {\n";
-        llvm::outs() << "  func.func @" << kernelName << "(";
-        CudaLauncher L(llvm::outs());
+        
+        BufOS << "  func.func @" << kernelName << "(";
+        CudaLauncher L(BufOS);
         bool first = true;
         for (auto *Param : FD->parameters()) {
             std::string pname = Param->getNameAsString();
@@ -604,48 +567,49 @@ public:
             } else {
                 ptype = mlirType(Param->getType());
             }
-            if (!first) llvm::outs() << ", ";
+            if (!first) BufOS << ", ";
             first = false;
-            llvm::outs() << "%" << pname << ": " << ptype;
+            BufOS << "%" << pname << ": " << ptype;
             L.declare(pname, "%" + pname, ptype, isMemref, dims);
         }
-        llvm::outs() << ")";
+        BufOS << ")";
         if (!isGlobal) {
-            llvm::outs() << " -> " << mlirType(FD->getReturnType());
+            BufOS << " -> " << mlirType(FD->getReturnType());
         }
-        llvm::outs() << " {\n";
-        llvm::outs() << "    %c0 = arith.constant 0 : index\n";
-        llvm::outs() << "    %c1 = arith.constant 1 : index\n";
-        llvm::outs() << "    %c2 = arith.constant 2 : index\n";
-        llvm::outs() << "    %c5 = arith.constant 5 : index\n";
-        llvm::outs() << "    %c10 = arith.constant 10 : index\n";
-        llvm::outs() << "    %c32 = arith.constant 32 : index\n";
-        llvm::outs() << "    %f0 = arith.constant 0.0 : f32\n";
-        llvm::outs() << "    %f1 = arith.constant 1.0 : f32\n";
+        BufOS << " {\n";
+        BufOS << "    %c0 = arith.constant 0 : index\n";
+        BufOS << "    %c1 = arith.constant 1 : index\n";
+        BufOS << "    %c2 = arith.constant 2 : index\n";
+        BufOS << "    %c5 = arith.constant 5 : index\n";
+        BufOS << "    %c10 = arith.constant 10 : index\n";
+        BufOS << "    %c32 = arith.constant 32 : index\n";
+        BufOS << "    %f0 = arith.constant 0.0 : f32\n";
+        BufOS << "    %f1 = arith.constant 1.0 : f32\n";
         
         if (isGlobal) {
-            llvm::outs() << "    %cTotal = arith.muli %N, %N : index\n";
-            llvm::outs() << "    scf.for %t = %c0 to %cTotal step %c1 {\n";
-            llvm::outs() << "      %row = arith.divsi %t, %N : index\n";
-            llvm::outs() << "      %col = arith.remsi %t, %N : index\n";
-            llvm::outs() << "      %bx = arith.divsi %row, %c2 : index\n";
-            llvm::outs() << "      %tx = arith.remsi %row, %c2 : index\n";
-            llvm::outs() << "      %by = arith.divsi %col, %c2 : index\n";
-            llvm::outs() << "      %ty = arith.remsi %col, %c2 : index\n";
-            dumpStmtAsMLIR(FD->getBody(), L);
-            llvm::outs() << "    }\n";
+            BufOS << "    %cTotal = arith.muli %N, %N : index\n";
+            BufOS << "    scf.for %t = %c0 to %cTotal step %c1 {\n";
+            BufOS << "      %row = arith.divsi %t, %N : index\n";
+            BufOS << "      %col = arith.remsi %t, %N : index\n";
+            BufOS << "      %bx = arith.divsi %row, %c2 : index\n";
+            BufOS << "      %tx = arith.remsi %row, %c2 : index\n";
+            BufOS << "      %by = arith.divsi %col, %c2 : index\n";
+            BufOS << "      %ty = arith.remsi %col, %c2 : index\n";
+            dumpStmtAsMLIR(FD->getBody(), L, BufOS);
+            BufOS << "    }\n";
         } else {
-            dumpStmtAsMLIR(FD->getBody(), L);
+            dumpStmtAsMLIR(FD->getBody(), L, BufOS);
         }
-        llvm::outs() << "    return\n";
-        llvm::outs() << "  }\n";
-        llvm::outs() << "}\n";
+        BufOS << "    return\n";
+        BufOS << "  }\n";
+        BufOS.flush();
+        FunctionBodies.push_back(buffer);
     }
 
     bool VisitFunctionDecl(FunctionDecl *FD) {
         if (FD->getTemplatedKind() == FunctionDecl::TK_FunctionTemplate) return true;
         if (FD->hasAttr<CUDAGlobalAttr>() || FD->hasAttr<CUDADeviceAttr>()) {
-            emitKernel(FD);
+            emitKernelToBuffer(FD);
         }
         return true;
     }
@@ -653,7 +617,7 @@ public:
     bool VisitFunctionTemplateDecl(FunctionTemplateDecl *FTD) {
         if (!FTD->getTemplatedDecl()->hasAttr<CUDAGlobalAttr>()) return true;
         for (auto *Spec : FTD->specializations()) {
-            emitKernel(Spec);
+            emitKernelToBuffer(Spec);
         }
         return true;
     }
@@ -679,6 +643,17 @@ public:
     }
 };
 
+// A FrontendAction that collects all functions from multiple files
+class MultiFileAction : public FrontendAction {
+public:
+    std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI, StringRef InFile) override {
+        return std::make_unique<CudaLaunchConsumer>(&CI.getASTContext());
+    }
+    void EndSourceFileAction() override {
+        // Don't emit here; we accumulate across files
+    }
+};
+
 int main(int argc, const char **argv) {
     auto ExpectedParser = CommonOptionsParser::create(argc, argv, MyToolCategory);
     if (!ExpectedParser) {
@@ -690,5 +665,16 @@ int main(int argc, const char **argv) {
     Tool.appendArgumentsAdjuster(clang::tooling::getInsertArgumentAdjuster(
         {"-x", "cuda", "--cuda-gpu-arch=sm_70", "--cuda-path=/tmp", "-nocudainc", "-nocudalib"},
         clang::tooling::ArgumentInsertPosition::BEGIN));
-    return Tool.run(newFrontendActionFactory<CudaLaunchAction>().get());
+    int ret = Tool.run(newFrontendActionFactory<CudaLaunchAction>().get());
+    
+    // Emit the merged module
+    if (!FunctionBodies.empty()) {
+        llvm::outs() << "// Target warp size: " << WarpSize << "\n";
+        llvm::outs() << "module {\n";
+        for (const auto &body : FunctionBodies) {
+            llvm::outs() << body;
+        }
+        llvm::outs() << "}\n";
+    }
+    return ret;
 }
