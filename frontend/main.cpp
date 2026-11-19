@@ -26,7 +26,6 @@ static int TempVarCounter = 0;
 static int LoopCounter = 0;
 static int WarpSize = 32;
 
-// GLOBAL REGISTRY: persists across all translation units
 static std::set<std::string> EmittedFunctions;
 static std::vector<std::string> FunctionBodies;
 
@@ -41,6 +40,7 @@ std::string mlirType(QualType T) {
         if (T->isSpecificBuiltinType(BuiltinType::Double)) return "f64";
         return "f32";
     }
+    if (T->isBooleanType()) return "i1";
     return "index";
 }
 
@@ -81,6 +81,30 @@ public:
         return "%" + name;
     }
 };
+
+bool isBooleanExpr(const Expr *E);
+
+bool isBooleanExpr(const Expr *E) {
+    if (!E) return false;
+    if (E->getType()->isBooleanType()) return true;
+    const Expr *inner = E->IgnoreParenImpCasts();
+    if (const auto *BO = dyn_cast<BinaryOperator>(inner)) {
+        int op = BO->getOpcode();
+        if (op == BO_LT || op == BO_GT || op == BO_LE || op == BO_GE || op == BO_EQ || op == BO_NE)
+            return true;
+        if (op == BO_LAnd || op == BO_LOr) return true;
+    }
+    return false;
+}
+
+CompoundAssignOperator *findAccumulation(Stmt *S) {
+    if (!S) return nullptr;
+    if (auto *CAO = dyn_cast<CompoundAssignOperator>(S))
+        if (CAO->getOpcode() == BO_AddAssign) return CAO;
+    for (Stmt *C : S->children())
+        if (auto *F = findAccumulation(C)) return F;
+    return nullptr;
+}
 
 std::string translateExpr(const Expr *E, CudaLauncher &L);
 
@@ -142,7 +166,7 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
                     std::string src_half = "%src_half_" + std::to_string(TempVarCounter++);
                     std::string same = "%same_" + std::to_string(TempVarCounter++);
                     std::string shfl = "%shfl_" + std::to_string(TempVarCounter++);
-                    L.OS << "      // WARP_EMULATION: 64-lane masked\n";
+                    L.OS << "      // WARP_EMULATION\n";
                     L.OS << "      " << half << " = arith.divsi %tx, %c32 : index\n";
                     L.OS << "      " << src_half << " = arith.divsi " << src << ", %c32 : index\n";
                     L.OS << "      " << same << " = arith.cmpi eq, " << half << ", " << src_half << " : index\n";
@@ -303,6 +327,9 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
                 else if (lty == "f64" || rty == "f64") ty = "f64";
             }
         }
+        bool isCmp = (BO->getOpcode() == BO_LT || BO->getOpcode() == BO_GT || 
+                      BO->getOpcode() == BO_LE || BO->getOpcode() == BO_GE ||
+                      BO->getOpcode() == BO_EQ || BO->getOpcode() == BO_NE);
         std::string op;
         switch (BO->getOpcode()) {
             case BO_Add: op = flt ? "arith.addf" : "arith.addi"; break;
@@ -311,10 +338,15 @@ std::string translateExpr(const Expr *E, CudaLauncher &L) {
             case BO_Div: op = flt ? "arith.divf" : "arith.divsi"; break;
             case BO_Rem: op = flt ? "arith.remf" : "arith.remsi"; break;
             case BO_LT:  op = flt ? "arith.cmpf olt," : "arith.cmpi slt,"; break;
+            case BO_GT:  op = flt ? "arith.cmpf ogt," : "arith.cmpi sgt,"; break;
+            case BO_LE:  op = flt ? "arith.cmpf ole," : "arith.cmpi sle,"; break;
+            case BO_GE:  op = flt ? "arith.cmpf oge," : "arith.cmpi sge,"; break;
             case BO_EQ:  op = flt ? "arith.cmpf oeq," : "arith.cmpi eq,"; break;
+            case BO_NE:  op = flt ? "arith.cmpf one," : "arith.cmpi ne,"; break;
             default: return lhs;
         }
         std::string v = "%" + std::to_string(TempVarCounter++);
+        std::string resType = isCmp ? "i1" : ty;
         L.OS << "      " << v << " = " << op << " " << lhs << ", " << rhs << " : " << ty << "\n";
         return v;
     }
@@ -374,27 +406,6 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L, raw_ostream &OS) {
             return i < (int)operands.size() ? operands[i] : fallback;
         };
         std::string v = "%" + std::to_string(TempVarCounter++);
-
-        if (asmStr.find("shfl.sync.down") != std::string::npos) {
-            if (WarpSize == 32) {
-                OS << "      " << v << " = nvvm.shfl.sync.down 0xffffffff, " << op(0, "%zero") << ", " << op(1, "%c1") << " : f32\n";
-            } else {
-                std::string half = "%half_" + std::to_string(TempVarCounter++);
-                std::string src_half = "%src_half_" + std::to_string(TempVarCounter++);
-                std::string same = "%same_" + std::to_string(TempVarCounter++);
-                std::string shfl = "%shfl_" + std::to_string(TempVarCounter++);
-                OS << "      " << half << " = arith.divsi %tx, %c32 : index\n";
-                OS << "      " << src_half << " = arith.divsi " << op(1, "%c1") << ", %c32 : index\n";
-                OS << "      " << same << " = arith.cmpi eq, " << half << ", " << src_half << " : index\n";
-                OS << "      " << v << " = scf.if " << same << " -> (f32) {\n";
-                OS << "        " << shfl << " = nvvm.shfl.sync.down 0xffffffff, " << op(0, "%zero") << ", " << op(1, "%c1") << " : f32\n";
-                OS << "        scf.yield " << shfl << " : f32\n";
-                OS << "      } else {\n";
-                OS << "        scf.yield " << op(0, "%zero") << " : f32\n";
-                OS << "      }\n";
-            }
-            return;
-        }
         if (asmStr.find("bar.sync") != std::string::npos) {
             OS << "      gpu.barrier\n";
             return;
@@ -443,9 +454,13 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L, raw_ostream &OS) {
 
     if (auto *If = dyn_cast<IfStmt>(S)) {
         std::string cond = translateExpr(If->getCond(), L);
-        std::string c1 = "%cmp_" + std::to_string(TempVarCounter++);
-        OS << "      " << c1 << " = arith.cmpi ne, " << cond << ", %c0 : index\n";
-        OS << "      scf.if " << c1 << " {\n";
+        if (isBooleanExpr(If->getCond())) {
+            OS << "      scf.if " << cond << " {\n";
+        } else {
+            std::string c1 = "%cmp_" + std::to_string(TempVarCounter++);
+            OS << "      " << c1 << " = arith.cmpi ne, " << cond << ", %c0 : index\n";
+            OS << "      scf.if " << c1 << " {\n";
+        }
         dumpStmtAsMLIR(If->getThen(), L, OS);
         OS << "      }";
         if (If->getElse()) {
@@ -507,18 +522,43 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L, raw_ostream &OS) {
         return;
     }
 
+    // FIX: For loop with accumulation (sum += ...)
     if (auto *For = dyn_cast<ForStmt>(S)) {
         std::string UB = "%N";
         if (const Expr *C = For->getCond())
             if (const auto *BO = dyn_cast<BinaryOperator>(C->IgnoreParenImpCasts()))
                 UB = translateExpr(BO->getRHS(), L);
+        
+        CompoundAssignOperator *CAO = findAccumulation(For->getBody());
+        std::string accVar = "";
+        std::string accType = "f32";
+        if (CAO) {
+            if (const auto *DRE = dyn_cast<DeclRefExpr>(CAO->getLHS()->IgnoreParenImpCasts()))
+                accVar = DRE->getDecl()->getNameAsString();
+            accType = exprType(CAO->getRHS());
+        }
+        
         std::string ivName = "%iv_" + std::to_string(LoopCounter++);
         L.declare("k", ivName, "index", false);
         L.declare("i", ivName, "index", false);
         L.declare("iv", ivName, "index", false);
-        OS << "      scf.for " << ivName << " = %c0 to " << UB << " step %c1 {\n";
-        dumpStmtAsMLIR(For->getBody(), L, OS);
-        OS << "      }\n";
+        
+        if (!accVar.empty()) {
+            std::string init = "%init_" + accVar;
+            std::string iter = "%iter_" + accVar;
+            OS << "      " << init << " = arith.constant 0.0 : " << accType << "\n";
+            OS << "      %acc_result = scf.for " << ivName << " = %c0 to " << UB << " step %c1 iter_args("
+               << iter << " = " << init << ") -> (" << accType << ") {\n";
+            std::string inner = translateExpr(CAO->getRHS(), L);
+            OS << "        %new_sum = arith.addf " << iter << ", " << inner << " : " << accType << "\n";
+            OS << "        scf.yield %new_sum : " << accType << "\n";
+            OS << "      }\n";
+            L.declare(accVar, "%acc_result", accType, false);
+        } else {
+            OS << "      scf.for " << ivName << " = %c0 to " << UB << " step %c1 {\n";
+            dumpStmtAsMLIR(For->getBody(), L, OS);
+            OS << "      }\n";
+        }
         return;
     }
 
@@ -539,14 +579,12 @@ public:
         if (!isDevice && !isGlobal) return;
 
         std::string kernelName = FD->getNameAsString();
-        // Deduplicate: skip if already emitted
         if (EmittedFunctions.count(kernelName)) return;
         EmittedFunctions.insert(kernelName);
 
         std::string buffer;
         llvm::raw_string_ostream BufOS(buffer);
-        TempVarCounter = 0;
-        LoopCounter = 0;
+        // Keep counters global so SSA values are unique across all functions
         
         BufOS << "  func.func @" << kernelName << "(";
         CudaLauncher L(BufOS);
@@ -643,17 +681,6 @@ public:
     }
 };
 
-// A FrontendAction that collects all functions from multiple files
-class MultiFileAction : public FrontendAction {
-public:
-    std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI, StringRef InFile) override {
-        return std::make_unique<CudaLaunchConsumer>(&CI.getASTContext());
-    }
-    void EndSourceFileAction() override {
-        // Don't emit here; we accumulate across files
-    }
-};
-
 int main(int argc, const char **argv) {
     auto ExpectedParser = CommonOptionsParser::create(argc, argv, MyToolCategory);
     if (!ExpectedParser) {
@@ -667,7 +694,6 @@ int main(int argc, const char **argv) {
         clang::tooling::ArgumentInsertPosition::BEGIN));
     int ret = Tool.run(newFrontendActionFactory<CudaLaunchAction>().get());
     
-    // Emit the merged module
     if (!FunctionBodies.empty()) {
         llvm::outs() << "// Target warp size: " << WarpSize << "\n";
         llvm::outs() << "module {\n";
