@@ -540,8 +540,8 @@ void dumpStmtAsMLIR(Stmt *S, CudaLauncher &L, raw_ostream &OS) {
         
         std::string ivName = "%iv_" + std::to_string(LoopCounter++);
         L.declare("k", ivName, "index", false);
-        L.declare("i", ivName, "index", false);
         L.declare("iv", ivName, "index", false);
+        // Do NOT declare "i" here — it is declared outside the loop
         
         if (!accVar.empty()) {
             std::string init = "%init_" + accVar;
